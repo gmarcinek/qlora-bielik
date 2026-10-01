@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bielik-lora-lab"
+version = "0.1.0"
+description = "Local Bielik inference, corpus management and LoRA/QLoRA training."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=1.0",
+  "datasets>=3.0",
+  "peft>=0.14",
+  "PyYAML>=6.0",
+  "torch>=2.4",
+  "transformers>=4.47",
+  "trl>=0.13",
+]
+
+[project.optional-dependencies]
+qlora = ["bitsandbytes>=0.44"]
+dev = ["pytest>=8.0"]
+server = ["fastapi>=0.115", "psycopg[binary,pool]>=3.2", "uvicorn[standard]>=0.30"]
+
+[project.scripts]
+bielik-lab = "bielik_lora.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

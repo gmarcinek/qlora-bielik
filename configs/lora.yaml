@@ -1,0 +1,18 @@
+model:
+  name: speakleash/Bielik-11B-v3.0-Instruct
+data:
+  train: data/exports/train.jsonl
+  validation: data/exports/validation.jsonl
+output_dir: artifacts/bielik-lora
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+training:
+  quantization: none
+  epochs: 3
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0001
+  max_length: 2048

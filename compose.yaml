@@ -1,0 +1,102 @@
+name: bielik-lab
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bielik}
+      POSTGRES_USER: ${POSTGRES_USER:-bielik}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bielik}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  liquibase:
+    image: liquibase/liquibase:4.29
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./database/changelog:/liquibase/changelog:ro
+    command:
+      - --search-path=/liquibase/changelog
+      - --changelog-file=master.xml
+      - --url=jdbc:postgresql://db:5432/${POSTGRES_DB:-bielik}
+      - --username=${POSTGRES_USER:-bielik}
+      - --password=${POSTGRES_PASSWORD:-bielik}
+      - update
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-bielik}:${POSTGRES_PASSWORD:-bielik}@db:5432/${POSTGRES_DB:-bielik}
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-bielik}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
+      TRAINING_HOST_ROOT: ${PWD}
+      TRAINER_IMAGE: bielik-lab-trainer:local
+    depends_on:
+      liquibase:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./backend:/app/backend
+      - ./configs:/app/configs:ro
+      - ./data:/workspace/data
+      - ./artifacts:/workspace/artifacts
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_PROXY_TARGET: http://api:8000
+    depends_on:
+      - api
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+
+  trainer:
+    profiles: ["training"]
+    build:
+      context: .
+      dockerfile: docker/trainer.Dockerfile
+    image: bielik-lab-trainer:local
+    environment:
+      HF_TOKEN: ${HF_TOKEN:?HF_TOKEN must be configured in .env}
+    command: bielik-lab train --config configs/qlora.yaml
+    volumes:
+      - ./artifacts:/workspace/artifacts
+      - ./configs:/workspace/configs:ro
+      - ./data:/workspace/data
+      - ./models:/workspace/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  postgres-data:
+  frontend-node-modules:

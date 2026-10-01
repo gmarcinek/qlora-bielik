@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Secrets
+.env
+
+# Data, training outputs and model weights
+data/*.sqlite3
+data/exports/
+artifacts/
+checkpoints/
+models/
+
+# OS / editor
+.DS_Store
+Thumbs.db

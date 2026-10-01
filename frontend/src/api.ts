@@ -1,0 +1,323 @@
+export type Corpus = {
+  id: string;
+  name: string;
+  description: string;
+  example_count: number;
+};
+
+export type Example = {
+  id: string;
+  corpus_id?: string;
+  corpus_name?: string;
+  created_at: string;
+  split: "train" | "validation" | "test";
+  messages: Array<{ role: string; content: string }>;
+  metadata: { flag?: ExampleFlag; import_id?: string };
+};
+
+export type MessageRole = "system" | "user" | "assistant";
+
+export type Message = {
+  role: MessageRole;
+  content: string;
+};
+
+export type ExampleFlag = "positive" | "negative" | "unclassified";
+
+type ExampleDraft = {
+  split: string;
+  messages: Message[];
+  flag: ExampleFlag;
+};
+
+export type ImportedExample = {
+  messages: Message[];
+  split?: "train" | "validation" | "test";
+  source?: string;
+  flag?: ExampleFlag;
+};
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    ...options,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail ?? "Nie udalo sie wykonac zadania.");
+  }
+  return response.json() as Promise<T>;
+}
+
+export type TrainingMetric = {
+  step: number;
+  max_steps: number;
+  time: number;
+  epoch?: number;
+  num_train_epochs?: number;
+  loss?: number;
+  eval_loss?: number;
+  learning_rate?: number;
+  grad_norm?: number;
+  train_loss?: number;
+  train_runtime?: number;
+};
+
+export type TrainingHyperparameters = {
+  learning_rate: number | null;
+  epochs: number | null;
+  batch_size: number | null;
+  gradient_accumulation_steps: number | null;
+  max_length: number | null;
+  quantization: string | null;
+  lora_rank: number | null;
+  lora_alpha: number | null;
+  lora_dropout: number | null;
+};
+
+export type TrainingStatus = {
+  state: string;
+  splits: Record<"train" | "validation" | "test", number>;
+  profile: string;
+  logs: string;
+  container_id: string | null;
+  exit_code?: number | null;
+  started_at?: string;
+  finished_at?: string;
+  metrics?: TrainingMetric[];
+  hyperparameters?: TrainingHyperparameters | null;
+  error?: string;
+  adapter_ready: boolean;
+  job?: {
+    corpus_id: string | null;
+    base_model: string | null;
+    adapter_name: string | null;
+  };
+};
+
+export type TrainingStart = {
+  corpusId: string;
+  baseModel: string;
+  adapterName: string;
+};
+
+export type ExampleReview = {
+  recommendation: "positive" | "negative" | "needs_review";
+  reason: string;
+  confidence: "high" | "medium" | "low";
+};
+
+export type ClassificationStatus = {
+  state: "idle" | "running" | "completed" | "failed";
+  total: number;
+  processed: number;
+  classified: number;
+  needs_review: number;
+  error: string | null;
+};
+
+export type ParaphraseProviderCatalog = {
+  providers: Record<
+    string,
+    {
+      label: string;
+      models: Record<string, { label: string }>;
+    }
+  >;
+};
+
+export const api = {
+  corpora: () => request<Corpus[]>("/api/corpora"),
+  createCorpus: (name: string, description: string) =>
+    request<Corpus>("/api/corpora", {
+      method: "POST",
+      body: JSON.stringify({ name, description }),
+    }),
+  examples: (corpusId: string) =>
+    request<Example[]>(`/api/corpora/${corpusId}/examples`),
+  allExamples: () => request<Example[]>("/api/examples"),
+  createExample: (corpusId: string, example: ExampleDraft) =>
+    request<Example>(`/api/corpora/${corpusId}/examples`, {
+      method: "POST",
+      body: JSON.stringify(example),
+    }),
+  importExamples: (corpusId: string, examples: ImportedExample[]) =>
+    request<{ imported: number; import_id: string }>(
+      `/api/corpora/${corpusId}/examples/import`,
+      {
+        method: "POST",
+        body: JSON.stringify({ examples }),
+      },
+    ),
+  systemPromptValidator: () =>
+    request<{ prompt: string }>("/api/system-prompts/validator"),
+  systemPromptParaphraser: () =>
+    request<{ prompt: string }>("/api/system-prompts/paraphraser"),
+  paraphraseProviders: () =>
+    request<ParaphraseProviderCatalog>("/api/paraphrase/providers"),
+  compareSystemPrompts: (
+    original: string,
+    candidate: string,
+    provider: string,
+    model: string,
+    validatorPrompt: string,
+  ) =>
+    request<{
+      semantic_equivalent: boolean;
+      instruction_plan_equivalent: boolean;
+      reason: string;
+    }>("/api/system-prompts/compare", {
+      method: "POST",
+      body: JSON.stringify({
+        original,
+        candidate,
+        provider,
+        model,
+        validator_prompt: validatorPrompt,
+      }),
+    }),
+  paraphraseSystemPrompt: (
+    original: string,
+    provider: string,
+    model: string,
+    paraphraserPrompt: string,
+  ) =>
+    request<{ candidate: string; missing_terms: string[] }>(
+      "/api/system-prompts/paraphrase",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          original,
+          provider,
+          model,
+          paraphraser_prompt: paraphraserPrompt,
+        }),
+      },
+    ),
+  paraphraseSelectedText: (
+    selectedText: string,
+    provider: string,
+    model: string,
+  ) =>
+    request<{ replacement: string }>("/api/text/paraphrase", {
+      method: "POST",
+      body: JSON.stringify({ selected_text: selectedText, provider, model }),
+    }),
+  updateExample: (exampleId: string, example: ExampleDraft) =>
+    request<Example>(`/api/examples/${exampleId}`, {
+      method: "PUT",
+      body: JSON.stringify(example),
+    }),
+  deleteExample: async (exampleId: string) => {
+    const response = await fetch(`/api/examples/${exampleId}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) throw new Error("Nie udało się usunąć encji.");
+  },
+  bulkSetFlag: (exampleIds: string[], flag: ExampleFlag) =>
+    request<{ updated: number }>("/api/examples/bulk/flag", {
+      method: "POST",
+      body: JSON.stringify({ example_ids: exampleIds, flag }),
+    }),
+  bulkSetSplit: (
+    exampleIds: string[],
+    split: "train" | "validation" | "test",
+  ) =>
+    request<{ updated: number }>("/api/examples/bulk/split", {
+      method: "POST",
+      body: JSON.stringify({ example_ids: exampleIds, split }),
+    }),
+  bulkSetSystemPrompt: (
+    exampleIds: string[],
+    prompt: string,
+    every: number,
+    original: string,
+  ) =>
+    request<{ updated: number; skipped: number }>(
+      "/api/examples/bulk/system-prompt",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          example_ids: exampleIds,
+          prompt,
+          every,
+          original,
+        }),
+      },
+    ),
+  bulkDelete: (exampleIds: string[]) =>
+    request<{ deleted: number }>("/api/examples/bulk/delete", {
+      method: "POST",
+      body: JSON.stringify({ example_ids: exampleIds }),
+    }),
+  bulkClassify: (exampleIds: string[]) =>
+    request<{ classified: number; needs_review: number; missing: number }>(
+      "/api/examples/bulk/classify",
+      {
+        method: "POST",
+        body: JSON.stringify({ example_ids: exampleIds }),
+      },
+    ),
+  classificationStatus: () =>
+    request<ClassificationStatus>("/api/examples/classification/status"),
+  startAutomaticClassification: (exampleIds: string[]) =>
+    request<ClassificationStatus>("/api/examples/classification/start", {
+      method: "POST",
+      body: JSON.stringify({ example_ids: exampleIds }),
+    }),
+  reviewExample: (exampleId: string) =>
+    request<ExampleReview>(`/api/examples/${exampleId}/review`, {
+      method: "POST",
+    }),
+  chat: (prompt: string) =>
+    request<{ response: string }>("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ prompt }),
+    }),
+  chatMessages: (messages: Message[]) =>
+    request<{ response: string }>("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ messages }),
+    }),
+  models: () => request<{ models: string[] }>("/api/models"),
+  trainingStatus: () => request<TrainingStatus>("/api/training/status"),
+  trainingModels: () => request<{ models: string[] }>("/api/training/models"),
+  startTraining: ({ corpusId, baseModel, adapterName }: TrainingStart) =>
+    request<TrainingStatus>("/api/training/start", {
+      method: "POST",
+      body: JSON.stringify({
+        corpus_id: corpusId,
+        base_model: baseModel,
+        adapter_name: adapterName,
+      }),
+    }),
+  stopTraining: () =>
+    request<TrainingStatus>("/api/training/stop", { method: "POST" }),
+  chatStream: async (
+    messages: Message[],
+    model: string,
+    onContent: (content: string) => void,
+  ) => {
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages, model, stream: true }),
+    });
+    if (!response.ok || !response.body) {
+      throw new Error("Nie udało się uruchomić strumienia odpowiedzi.");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let remainder = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      remainder += decoder.decode(value, { stream: true });
+      const lines = remainder.split("\n");
+      remainder = lines.pop() ?? "";
+      lines
+        .filter(Boolean)
+        .forEach((line) => onContent(JSON.parse(line).content));
+    }
+  },
+};

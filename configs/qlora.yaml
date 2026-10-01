@@ -1,0 +1,30 @@
+model:
+  name: speakleash/Bielik-11B-v3.0-Instruct
+  device_map: auto
+  max_memory:
+    0: 14GiB
+    cpu: 40GiB
+data:
+  train: data/exports/train.jsonl
+  validation: data/exports/validation.jsonl
+output_dir: artifacts/bielik-qlora
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+training:
+  quantization: 4bit
+  quantization_type: nf4
+  double_quantization: true
+  epochs: 3
+  batch_size: 1
+  gradient_accumulation_steps: 32
+  learning_rate: 0.0002
+  max_length: 1024
+  optimizer: paged_adamw_8bit
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs: {use_reentrant: false}
+  use_cache: false
+  empty_cache_steps: 10
+  save_total_limit: 2

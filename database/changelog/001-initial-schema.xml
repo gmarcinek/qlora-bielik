@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <changeSet id="001-enable-extensions-and-create-corpus-schema" author="bielik-lab">
+        <sql splitStatements="true"> CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT
+            EXISTS pgcrypto; CREATE TABLE corpora ( id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ
+            NOT NULL DEFAULT now() ); CREATE TABLE training_examples ( id UUID PRIMARY KEY DEFAULT
+            gen_random_uuid(), corpus_id UUID NOT NULL REFERENCES corpora(id) ON DELETE CASCADE,
+            split TEXT NOT NULL CHECK (split IN ('train', 'validation', 'test')), messages JSONB NOT
+            NULL, source TEXT, metadata JSONB NOT NULL DEFAULT '{}'::jsonb, embedding vector,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now() ); CREATE INDEX
+            training_examples_corpus_split_idx ON training_examples (corpus_id, split); CREATE INDEX
+            training_examples_metadata_idx ON training_examples USING GIN (metadata); </sql>
+        <rollback> DROP TABLE IF EXISTS training_examples; DROP TABLE IF EXISTS corpora; </rollback>
+    </changeSet>
+</databaseChangeLog>
