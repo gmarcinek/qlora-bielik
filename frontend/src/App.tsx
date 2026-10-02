@@ -14,8 +14,14 @@ import {
   Check,
   Database,
   Download,
+  File as FileIcon,
+  FileCode,
+  FileImage,
   FilePlus2,
+  FileSpreadsheet,
+  FileText,
   FileUp,
+  Folder,
   FolderOpen,
   Copy,
   GraduationCap,
@@ -51,7 +57,12 @@ import {
   CorpusAnalysis,
   CorpusAnalysisPart,
   CorpusSettings,
+  AnalysisTypeRow,
+  EntityTypeDefinition,
   ExampleIssue,
+  ModelChoice,
+  PreferenceBatchRequest,
+  PreferenceBatchStatus,
   SplitRatio,
   ExampleFlag,
   BulkTransformResult,
@@ -64,6 +75,7 @@ import {
   ExportQuantization,
   AgentModel,
   AgentSession,
+  AgentAttachment,
   ImportedExample,
   Message,
   MessageRole,
@@ -148,11 +160,11 @@ function parseImportFile(content: string): Record<string, unknown>[] {
     return value as Record<string, unknown>;
   };
   const trimmed = content.trim();
-  if (!trimmed) throw new Error("Plik nie zawiera encji JSONL.");
+  if (!trimmed) throw new Error("Plik nie zawiera przykładów JSONL.");
   if (trimmed.startsWith("[")) {
     const records = JSON.parse(trimmed) as unknown;
     if (!Array.isArray(records))
-      throw new Error("Plik JSON musi zawierać tablicę encji.");
+      throw new Error("Plik JSON musi zawierać tablicę przykładów.");
     return records.map(record);
   }
   return trimmed.split(/\r?\n/).map((line, index) => {
@@ -347,6 +359,296 @@ const SESSION_AREAS: Array<[string, string]> = [
   ["notes", "Notatki (notes)"],
   ["scripts", "Skrypty (scripts)"],
 ];
+
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+// Office documents are converted to PDF by LibreOffice in the sandbox.
+const PDF_EXTENSIONS = [
+  "pdf",
+  "doc",
+  "docx",
+  "odt",
+  "rtf",
+  "ppt",
+  "pptx",
+  "odp",
+];
+const SHEET_EXTENSIONS = ["xlsx", "xlsm", "xls", "ods", "csv", "tsv"];
+const CODE_EXTENSIONS = [
+  "py",
+  "sh",
+  "json",
+  "jsonl",
+  "yaml",
+  "yml",
+  "js",
+  "ts",
+];
+
+const extensionOf = (path: string) =>
+  path.includes(".") ? path.split(".").pop()!.toLowerCase() : "";
+
+function SessionFileIcon({ path }: { path: string }) {
+  const extension = extensionOf(path);
+  if (IMAGE_EXTENSIONS.includes(extension)) return <FileImage size={16} />;
+  if (SHEET_EXTENSIONS.includes(extension))
+    return <FileSpreadsheet size={16} />;
+  if (CODE_EXTENSIONS.includes(extension)) return <FileCode size={16} />;
+  if ([...PDF_EXTENSIONS, "md", "txt"].includes(extension))
+    return <FileText size={16} />;
+  return <FileIcon size={16} />;
+}
+
+type SessionFile = { path: string; bytes: number };
+type FileTree = { folders: Map<string, FileTree>; files: SessionFile[] };
+
+function buildTree(files: SessionFile[], prefix: string): FileTree {
+  const root: FileTree = { folders: new Map(), files: [] };
+  for (const file of files) {
+    const parts = file.path.slice(prefix.length).split("/");
+    let node = root;
+    for (const folder of parts.slice(0, -1)) {
+      if (!node.folders.has(folder))
+        node.folders.set(folder, { folders: new Map(), files: [] });
+      node = node.folders.get(folder)!;
+    }
+    node.files.push(file);
+  }
+  return root;
+}
+
+function FilePreview({ sessionId, path }: { sessionId: string; path: string }) {
+  const url = `/api/agent/sessions/${sessionId}/preview?path=${encodeURIComponent(path)}`;
+  const extension = extensionOf(path);
+  const binary =
+    IMAGE_EXTENSIONS.includes(extension) || PDF_EXTENSIONS.includes(extension);
+  const [result, setResult] = useState<{
+    kind: string;
+    content: string;
+    truncated?: boolean;
+  } | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    setResult(null);
+    setError("");
+    if (binary) return;
+    let current = true;
+    void fetch(url)
+      .then(async (response) => {
+        const body = await response.json();
+        if (!response.ok)
+          throw new Error(body.detail ?? "Podgląd niedostępny.");
+        if (current) setResult(body);
+      })
+      .catch((fetchError: Error) => current && setError(fetchError.message));
+    return () => {
+      current = false;
+    };
+  }, [url, binary]);
+  if (IMAGE_EXTENSIONS.includes(extension))
+    return (
+      <div className="file-preview-image">
+        <img src={url} alt={path} />
+      </div>
+    );
+  if (PDF_EXTENSIONS.includes(extension))
+    return <iframe className="file-preview-frame" src={url} title={path} />;
+  if (error) return <div className="alert alert-warning m-3">{error}</div>;
+  if (!result)
+    return <div className="text-secondary p-3">Wczytywanie podglądu…</div>;
+  return (
+    <div className="file-preview-text">
+      {result.truncated && (
+        <div className="alert alert-light border small py-1">
+          Podgląd skrócony — pełny plik pobierzesz przyciskiem obok nazwy.
+        </div>
+      )}
+      {result.kind === "markdown" ? (
+        <div className="markdown-preview">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {result.content}
+          </ReactMarkdown>
+        </div>
+      ) : result.kind === "text" ? (
+        <pre>{result.content}</pre>
+      ) : (
+        <div className="text-secondary">{result.content}</div>
+      )}
+    </div>
+  );
+}
+
+function SessionFilesDrawer({
+  sessionId,
+  files,
+  attachmentsByPath,
+  onRefresh,
+  onClose,
+}: {
+  sessionId: string;
+  files: SessionFile[];
+  attachmentsByPath: Map<string, AgentAttachment>;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (selected) setSelected(null);
+      else onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selected, onClose]);
+  const toggle = (key: string) =>
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  const renderTree = (
+    tree: FileTree,
+    key: string,
+    depth: number,
+  ): ReactNode => (
+    <>
+      {[...tree.folders.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, child]) => {
+          const childKey = `${key}/${name}`;
+          const open = !collapsed.has(childKey);
+          return (
+            <div key={childKey}>
+              <button
+                className="files-drawer-row folder"
+                type="button"
+                style={{ paddingLeft: `${0.5 + depth}rem` }}
+                onClick={() => toggle(childKey)}
+              >
+                {open ? <FolderOpen size={16} /> : <Folder size={16} />}
+                <span>{name}</span>
+              </button>
+              {open && renderTree(child, childKey, depth + 1)}
+            </div>
+          );
+        })}
+      {[...tree.files]
+        .sort((a, b) => a.path.localeCompare(b.path))
+        .map((file) => {
+          const attachment = attachmentsByPath.get(file.path);
+          return (
+            <button
+              key={file.path}
+              className={`files-drawer-row file ${selected === file.path ? "active" : ""}`}
+              type="button"
+              style={{ paddingLeft: `${0.5 + depth}rem` }}
+              title={file.path}
+              onClick={() => setSelected(file.path)}
+            >
+              <SessionFileIcon path={file.path} />
+              <span className="text-truncate">
+                {file.path.split("/").pop()}
+              </span>
+              {attachment && (
+                <span className="badge text-bg-light border text-dark">
+                  {attachment.id}
+                </span>
+              )}
+              <small className="text-secondary ms-auto">
+                {formatBytes(file.bytes)}
+              </small>
+            </button>
+          );
+        })}
+    </>
+  );
+  return (
+    <aside
+      className={`files-drawer ${selected ? "expanded" : ""}`}
+      aria-label="Pliki rozmowy"
+    >
+      <div className="files-drawer-list">
+        <div className="files-drawer-header">
+          <strong>Pliki rozmowy · {sessionId.slice(0, 8)}</strong>
+          <span className="d-flex gap-1">
+            <button
+              className="btn btn-sm btn-outline-secondary"
+              type="button"
+              title="Odśwież"
+              onClick={onRefresh}
+            >
+              <RefreshCw size={14} />
+            </button>
+            <button
+              className="btn btn-sm btn-outline-secondary"
+              type="button"
+              title="Zamknij"
+              onClick={onClose}
+            >
+              <X size={14} />
+            </button>
+          </span>
+        </div>
+        <div className="files-drawer-tree">
+          {SESSION_AREAS.map(([area, label]) => {
+            const areaFiles = files.filter((file) =>
+              file.path.startsWith(`${area}/`),
+            );
+            const open = !collapsed.has(area) && areaFiles.length > 0;
+            return (
+              <div key={area}>
+                <button
+                  className="files-drawer-row folder area"
+                  type="button"
+                  disabled={!areaFiles.length}
+                  onClick={() => toggle(area)}
+                >
+                  {open ? <FolderOpen size={16} /> : <Folder size={16} />}
+                  <span>{label}</span>
+                  <small className="text-secondary ms-auto">
+                    {areaFiles.length}
+                  </small>
+                </button>
+                {open && renderTree(buildTree(areaFiles, `${area}/`), area, 1)}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {selected && (
+        <div className="files-drawer-preview">
+          <div className="files-drawer-header">
+            <span className="d-flex align-items-center gap-2 text-truncate">
+              <SessionFileIcon path={selected} />
+              <strong className="text-truncate">{selected}</strong>
+            </span>
+            <span className="d-flex gap-1">
+              <a
+                className="btn btn-sm btn-outline-secondary"
+                href={`/api/agent/sessions/${sessionId}/files?path=${encodeURIComponent(selected)}`}
+                download={selected.split("/").pop()}
+                title="Pobierz"
+              >
+                <Download size={14} />
+              </a>
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                type="button"
+                title="Zamknij podgląd"
+                onClick={() => setSelected(null)}
+              >
+                <X size={14} />
+              </button>
+            </span>
+          </div>
+          <FilePreview sessionId={sessionId} path={selected} />
+        </div>
+      )}
+    </aside>
+  );
+}
 
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
@@ -693,81 +995,14 @@ function EntityAgentPanel({
           ))}
         </select>
       </div>
-      {filesOpen && (
-        <div className="entity-agent-filesystem">
-          <div className="d-flex justify-content-between align-items-center mb-2">
-            <strong className="small">
-              Pliki rozmowy · {conversationId.slice(0, 8)}
-            </strong>
-            <div className="d-flex gap-1">
-              <button
-                className="btn btn-sm btn-outline-secondary"
-                type="button"
-                title="Odśwież"
-                onClick={() => void refreshFiles(conversationId)}
-              >
-                <RefreshCw size={14} />
-              </button>
-              <button
-                className="btn btn-sm btn-outline-secondary"
-                type="button"
-                title="Zamknij"
-                onClick={() => setFilesOpen(false)}
-              >
-                <X size={14} />
-              </button>
-            </div>
-          </div>
-          {SESSION_AREAS.map(([area, label]) => {
-            const files = visibleFiles.filter((file) =>
-              file.path.startsWith(`${area}/`),
-            );
-            return (
-              <section key={area} className="mb-3">
-                <div className="small text-secondary mb-1">
-                  {label} · {files.length}
-                </div>
-                {files.length ? (
-                  <ul className="list-unstyled small mb-0">
-                    {files.map((file) => {
-                      const attachment = attachmentsByPath.get(file.path);
-                      return (
-                        <li key={file.path} className="entity-agent-file">
-                          {attachment && (
-                            <span className="badge text-bg-light border text-dark me-1">
-                              {attachment.id}
-                            </span>
-                          )}
-                          <a
-                            href={`/api/agent/sessions/${conversationId}/files?path=${encodeURIComponent(file.path)}`}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            {file.path.slice(area.length + 1)}
-                          </a>{" "}
-                          <span className="text-secondary">
-                            {formatBytes(file.bytes)}
-                            {attachment ? ` · ${attachment.handling}` : ""}
-                          </span>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                ) : (
-                  <div className="small text-secondary">—</div>
-                )}
-              </section>
-            );
-          })}
-          <button
-            className="btn btn-sm btn-outline-primary"
-            type="button"
-            disabled={!corpus || !conversationId}
-            onClick={() => uploadRef.current?.click()}
-          >
-            <Paperclip size={14} className="me-1" /> Dodaj pliki
-          </button>
-        </div>
+      {filesOpen && conversationId && (
+        <SessionFilesDrawer
+          sessionId={conversationId}
+          files={visibleFiles}
+          attachmentsByPath={attachmentsByPath}
+          onRefresh={() => void refreshFiles(conversationId)}
+          onClose={() => setFilesOpen(false)}
+        />
       )}
       <div className="entity-agent-log" ref={logRef}>
         {!corpus && (
@@ -981,16 +1216,26 @@ function MessageContent({
   return <p className="json-content">{parts}</p>;
 }
 
-type CorpusView = "list" | "proposals" | "analysis" | "duplicates" | "settings";
+type CorpusView =
+  | "list"
+  | "proposals"
+  | "analysis"
+  | "duplicates"
+  | "vocabulary"
+  | "dpo"
+  | "settings";
 
 const DEFAULT_SPLIT_RATIO: SplitRatio = { train: 80, validation: 10, test: 10 };
 
+// One editor for both tabs: they save the same corpus settings object.
 function CorpusSettingsView({
   corpusId,
   onSaved,
+  section,
 }: {
   corpusId: string;
   onSaved: () => void;
+  section: "general" | "vocabulary";
 }) {
   const [settings, setSettings] = useState<CorpusSettings | null>(null);
   const [models, setModels] = useState<AgentModel[]>([]);
@@ -1007,6 +1252,23 @@ function CorpusSettingsView({
   if (!settings) return <div className="text-secondary">Wczytywanie…</div>;
   const ratio = settings.split_ratio ?? DEFAULT_SPLIT_RATIO;
   const ratioSum = ratio.train + ratio.validation + ratio.test;
+  const types = settings.entity_types ?? [];
+  const setTypes = (next: EntityTypeDefinition[]) =>
+    setSettings({ ...settings, entity_types: next });
+  const updateType = (index: number, change: Partial<EntityTypeDefinition>) =>
+    setTypes(
+      types.map((item, i) => (i === index ? { ...item, ...change } : item)),
+    );
+  async function loadTypesFromCorpus() {
+    const analysis = await api.corpusAnalysis(corpusId);
+    const known = new Set(types.map((item) => item.name));
+    setTypes([
+      ...types,
+      ...[...analysis.corpus.types, ...(analysis.corpus.labels ?? [])]
+        .filter((row) => row.type !== "(bez typu)" && !known.has(row.type))
+        .map((row) => ({ name: row.type, definition: "", boundary: "" })),
+    ]);
+  }
   const setRatio = (split: keyof SplitRatio, value: number) =>
     setSettings({
       ...settings,
@@ -1018,7 +1280,13 @@ function CorpusSettingsView({
     setMessage(null);
     try {
       setSettings(await api.updateCorpusSettings(corpusId, settings));
-      setMessage({ ok: true, text: "Zapisano ustawienia korpusu." });
+      setMessage({
+        ok: true,
+        text:
+          section === "vocabulary"
+            ? "Zapisano słownik."
+            : "Zapisano ustawienia korpusu.",
+      });
       onSaved();
     } catch (error) {
       setMessage({
@@ -1031,89 +1299,203 @@ function CorpusSettingsView({
   }
   return (
     <section className="corpus-settings">
-      <div className="mb-4">
-        <label className="form-label fw-semibold" htmlFor="corpus-agent-prompt">
-          Dodatkowy prompt systemowy korpusu
-        </label>
-        <p className="small text-secondary mb-2">
-          Opisz, do czego służy ten korpus i na co asystent ma zwracać uwagę —
-          tekst trafia do instrukcji asystenta przy każdej rozmowie w tym
-          korpusie.
-        </p>
-        <textarea
-          id="corpus-agent-prompt"
-          className="form-control"
-          rows={8}
-          maxLength={20000}
-          value={settings.agent_prompt}
-          placeholder="Np. Korpus uczy Bielika ekstrakcji wyłączeń odpowiedzialności z OWU. Wiadomość użytkownika zawsze zawiera tytuł artykułu i zdanie wprowadzające…"
-          onChange={(event) =>
-            setSettings({ ...settings, agent_prompt: event.target.value })
-          }
-        />
-      </div>
-      <div className="mb-4">
-        <label className="form-label fw-semibold" htmlFor="corpus-model">
-          Domyślny model asystenta
-        </label>
-        <select
-          id="corpus-model"
-          className="form-select corpus-settings-model"
-          value={settings.default_model ?? ""}
-          onChange={(event) =>
-            setSettings({
-              ...settings,
-              default_model: event.target.value || null,
-            })
-          }
-        >
-          <option value="">— jak w panelu asystenta —</option>
-          {models.map((item) => (
-            <option key={item.id} value={item.id} disabled={!item.available}>
-              {item.label}
-              {item.available ? "" : " (brak klucza API)"}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="mb-4">
-        <span className="form-label fw-semibold d-block">
-          Docelowe proporcje splitów
-        </span>
-        <p className="small text-secondary mb-2">
-          Asystent przypisuje split nowym propozycjom tak, by zbliżać korpus do
-          tych proporcji; zakładka Analiza pokazuje odchylenie.
-        </p>
-        <div className="d-flex flex-wrap gap-2 align-items-center">
-          {(Object.keys(DEFAULT_SPLIT_RATIO) as Array<keyof SplitRatio>).map(
-            (split) => (
-              <div
-                className="input-group input-group-sm split-ratio-input"
-                key={split}
-              >
-                <span className="input-group-text">{split}</span>
-                <input
-                  className="form-control"
-                  type="number"
-                  min={0}
-                  max={100}
-                  value={ratio[split]}
-                  onChange={(event) =>
-                    setRatio(split, Number(event.target.value) || 0)
-                  }
-                  aria-label={`Udział ${split}`}
-                />
-                <span className="input-group-text">%</span>
-              </div>
-            ),
+      {section === "general" && (
+        <>
+          <div className="mb-4">
+            <label
+              className="form-label fw-semibold"
+              htmlFor="corpus-agent-prompt"
+            >
+              Dodatkowy prompt systemowy korpusu
+            </label>
+            <p className="small text-secondary mb-2">
+              Opisz, do czego służy ten korpus i na co asystent ma zwracać uwagę
+              — tekst trafia do instrukcji asystenta przy każdej rozmowie w tym
+              korpusie.
+            </p>
+            <textarea
+              id="corpus-agent-prompt"
+              className="form-control"
+              rows={8}
+              maxLength={20000}
+              value={settings.agent_prompt}
+              placeholder="Np. Korpus uczy Bielika ekstrakcji wyłączeń odpowiedzialności z OWU. Wiadomość użytkownika zawsze zawiera tytuł artykułu i zdanie wprowadzające…"
+              onChange={(event) =>
+                setSettings({ ...settings, agent_prompt: event.target.value })
+              }
+            />
+          </div>
+          <div className="mb-4">
+            <label className="form-label fw-semibold" htmlFor="corpus-model">
+              Domyślny model asystenta
+            </label>
+            <select
+              id="corpus-model"
+              className="form-select corpus-settings-model"
+              value={settings.default_model ?? ""}
+              onChange={(event) =>
+                setSettings({
+                  ...settings,
+                  default_model: event.target.value || null,
+                })
+              }
+            >
+              <option value="">— jak w panelu asystenta —</option>
+              {models.map((item) => (
+                <option
+                  key={item.id}
+                  value={item.id}
+                  disabled={!item.available}
+                >
+                  {item.label}
+                  {item.available ? "" : " (brak klucza API)"}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="mb-4">
+            <label
+              className="form-label fw-semibold"
+              htmlFor="corpus-exchanges"
+            >
+              Wymiany w przykładach asystenta
+            </label>
+            <select
+              id="corpus-exchanges"
+              className="form-select corpus-settings-model"
+              value={settings.max_exchanges ?? 1}
+              onChange={(event) =>
+                setSettings({
+                  ...settings,
+                  max_exchanges: Number(event.target.value),
+                })
+              }
+            >
+              <option value={1}>1 — user + assistant</option>
+              <option value={2}>do 2 — z dopytaniem (followup)</option>
+            </select>
+          </div>
+        </>
+      )}
+      {section === "vocabulary" && (
+        <div className="mb-4">
+          <p className="small text-secondary mb-3">
+            Pojęcia, których uczy korpus: typy elementów w ekstrakcji (pole{" "}
+            <code>type</code>) i etykiety w klasyfikacji. Gdy słownik nie jest
+            pusty, asystent używa tylko tych nazw, a analiza zgłasza pozycje
+            spoza słownika. Definicje trafiają do instrukcji asystenta (też dla
+            przykładów definicyjnych), a „NIE jest nim” opisuje przypadek
+            graniczny — z niego powstają trudne negatywy i pary kontrastowe.
+          </p>
+          {types.length > 0 && (
+            <div className="entity-type-row entity-type-head small text-secondary">
+              <span>Nazwa</span>
+              <span>Definicja</span>
+              <span>NIE jest nim (przypadek graniczny)</span>
+              <span />
+            </div>
           )}
-          <span
-            className={`small ${ratioSum === 100 ? "text-secondary" : "text-danger"}`}
-          >
-            Suma: {ratioSum}%
-          </span>
+          {types.map((item, index) => (
+            <div className="entity-type-row" key={index}>
+              <input
+                className="form-control form-control-sm font-monospace"
+                value={item.name}
+                placeholder="EXCLUSION"
+                aria-label="Nazwa typu"
+                onChange={(event) =>
+                  updateType(index, { name: event.target.value })
+                }
+              />
+              <input
+                className="form-control form-control-sm"
+                value={item.definition}
+                placeholder="Definicja, np. sytuacja, w której ubezpieczyciel nie wypłaci świadczenia"
+                aria-label={`Definicja ${item.name}`}
+                onChange={(event) =>
+                  updateType(index, { definition: event.target.value })
+                }
+              />
+              <input
+                className="form-control form-control-sm"
+                value={item.boundary}
+                placeholder="NIE jest nim, np. sama nazwa choroby bez wyłączenia"
+                aria-label={`Granica ${item.name}`}
+                onChange={(event) =>
+                  updateType(index, { boundary: event.target.value })
+                }
+              />
+              <button
+                className="btn btn-sm btn-outline-danger"
+                type="button"
+                title="Usuń typ ze słownika"
+                aria-label={`Usuń ${item.name}`}
+                onClick={() => setTypes(types.filter((_, i) => i !== index))}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+          <div className="d-flex gap-2 mt-2">
+            <button
+              className="btn btn-sm btn-outline-primary"
+              type="button"
+              onClick={() =>
+                setTypes([...types, { name: "", definition: "", boundary: "" }])
+              }
+            >
+              Dodaj typ
+            </button>
+            <button
+              className="btn btn-sm btn-outline-secondary"
+              type="button"
+              title="Dopisuje typy występujące w odpowiedziach korpusu (od najczęstszych); usuń te, które są podkategoriami"
+              onClick={() => void loadTypesFromCorpus()}
+            >
+              Wczytaj typy z korpusu
+            </button>
+          </div>
         </div>
-      </div>
+      )}
+      {section === "general" && (
+        <div className="mb-4">
+          <span className="form-label fw-semibold d-block">
+            Docelowe proporcje splitów
+          </span>
+          <p className="small text-secondary mb-2">
+            Asystent przypisuje split nowym propozycjom tak, by zbliżać korpus
+            do tych proporcji; zakładka Analiza pokazuje odchylenie.
+          </p>
+          <div className="d-flex flex-wrap gap-2 align-items-center">
+            {(Object.keys(DEFAULT_SPLIT_RATIO) as Array<keyof SplitRatio>).map(
+              (split) => (
+                <div
+                  className="input-group input-group-sm split-ratio-input"
+                  key={split}
+                >
+                  <span className="input-group-text">{split}</span>
+                  <input
+                    className="form-control"
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={ratio[split]}
+                    onChange={(event) =>
+                      setRatio(split, Number(event.target.value) || 0)
+                    }
+                    aria-label={`Udział ${split}`}
+                  />
+                  <span className="input-group-text">%</span>
+                </div>
+              ),
+            )}
+            <span
+              className={`small ${ratioSum === 100 ? "text-secondary" : "text-danger"}`}
+            >
+              Suma: {ratioSum}%
+            </span>
+          </div>
+        </div>
+      )}
       {message && (
         <div
           className={`alert py-2 ${message.ok ? "alert-success" : "alert-danger"}`}
@@ -1127,7 +1509,7 @@ function CorpusSettingsView({
         disabled={saving || ratioSum !== 100}
         onClick={() => void save()}
       >
-        Zapisz ustawienia
+        {section === "vocabulary" ? "Zapisz słownik" : "Zapisz ustawienia"}
       </button>
     </section>
   );
@@ -1164,6 +1546,383 @@ function BalanceBar({
   );
 }
 
+function PreferenceBatchView({
+  corpusId,
+  onProgress,
+}: {
+  corpusId: string;
+  onProgress: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [sourceName, setSourceName] = useState("dokument");
+  const [chunkChars, setChunkChars] = useState(1500);
+  const [maxChunks, setMaxChunks] = useState(30);
+  const [hint, setHint] = useState("");
+  const [system, setSystem] = useState("");
+  const [models, setModels] = useState<Array<ModelChoice & { label: string }>>(
+    [],
+  );
+  const [instructionModel, setInstructionModel] = useState("");
+  const [rejectedModel, setRejectedModel] = useState("");
+  const [preview, setPreview] = useState<{
+    total: number;
+    used: number;
+    sample: string[];
+  } | null>(null);
+  const [status, setStatus] = useState<PreferenceBatchStatus | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    void api.paraphraseProviders().then((catalog) => {
+      const options = Object.entries(catalog.providers).flatMap(
+        ([provider, entry]) =>
+          Object.entries(entry.models).map(([model, info]) => ({
+            provider,
+            model,
+            label: `${entry.label} · ${info.label}`,
+          })),
+      );
+      setModels(options);
+      const key = (item: ModelChoice) => `${item.provider}::${item.model}`;
+      const api_ = options.find((item) => item.provider !== "ollama");
+      const local = options.find((item) => item.provider === "ollama");
+      setInstructionModel((current) => current || (api_ ? key(api_) : ""));
+      setRejectedModel(
+        (current) => current || (local ? key(local) : api_ ? key(api_) : ""),
+      );
+    });
+    void api.preferenceBatchStatus().then(setStatus);
+  }, []);
+  const running = status?.state === "running";
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => {
+      void api.preferenceBatchStatus().then((next) => {
+        setStatus(next);
+        onProgress();
+      });
+    }, 3000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+  const choice = (value: string): ModelChoice => {
+    const [provider, ...rest] = value.split("::");
+    return { provider, model: rest.join("::") };
+  };
+  const payload = (): PreferenceBatchRequest => ({
+    text,
+    source_name: sourceName,
+    chunk_chars: chunkChars,
+    max_chunks: maxChunks,
+    hint,
+    system,
+    instruction_model: choice(instructionModel),
+    rejected_model: choice(rejectedModel),
+  });
+  async function run(action: () => Promise<void>) {
+    setError("");
+    try {
+      await action();
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : String(requestError),
+      );
+    }
+  }
+  const modelSelect = (
+    value: string,
+    onChange: (value: string) => void,
+    label: string,
+  ) => (
+    <select
+      className="form-select form-select-sm"
+      value={value}
+      aria-label={label}
+      onChange={(event) => onChange(event.target.value)}
+    >
+      {models.map((item) => (
+        <option
+          key={`${item.provider}::${item.model}`}
+          value={`${item.provider}::${item.model}`}
+        >
+          {item.label}
+        </option>
+      ))}
+    </select>
+  );
+  return (
+    <section className="corpus-settings">
+      <p className="small text-secondary">
+        Dokument (rozdziały książki, artykuły, korespondencja…) jest dzielony na
+        fragmenty. Dla każdego fragmentu model poleceń dopisuje polecenie, na
+        które fragment jest odpowiedzią; <strong>chosen</strong> = oryginalny
+        fragment, <strong>rejected</strong> = odpowiedź wybranego modelu na to
+        polecenie (najlepiej modelu, który będziesz dostrajać). Pary trafiają do
+        Propozycji; po akceptacji eksportujesz je jako DPO JSONL.
+      </p>
+      <div className="mb-3">
+        <div className="d-flex gap-2 align-items-center mb-2">
+          <label className="btn btn-sm btn-outline-primary mb-0">
+            <FileUp size={15} className="me-1" /> Wczytaj plik .txt / .md
+            <input
+              className="visually-hidden"
+              type="file"
+              accept=".txt,.md,.markdown,text/plain"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+                setSourceName(file.name);
+                void file.text().then(setText);
+                setPreview(null);
+              }}
+            />
+          </label>
+          <input
+            className="form-control form-control-sm"
+            value={sourceName}
+            onChange={(event) => setSourceName(event.target.value)}
+            aria-label="Nazwa źródła"
+            style={{ maxWidth: "18rem" }}
+          />
+          <small className="text-secondary">{text.length} znaków</small>
+        </div>
+        <textarea
+          className="form-control"
+          rows={8}
+          value={text}
+          placeholder="…albo wklej tekst. Rozdziały (Rozdział, #, numeracja) zaczynają nowy fragment."
+          onChange={(event) => {
+            setText(event.target.value);
+            setPreview(null);
+          }}
+        />
+      </div>
+      <div className="row g-2 mb-3">
+        <div className="col-6 col-md-3">
+          <label className="form-label small mb-1">
+            Rozmiar fragmentu (znaki)
+          </label>
+          <input
+            className="form-control form-control-sm"
+            type="number"
+            min={300}
+            max={6000}
+            value={chunkChars}
+            onChange={(event) =>
+              setChunkChars(Number(event.target.value) || 1500)
+            }
+          />
+        </div>
+        <div className="col-6 col-md-3">
+          <label className="form-label small mb-1">Maks. par w partii</label>
+          <input
+            className="form-control form-control-sm"
+            type="number"
+            min={1}
+            max={500}
+            value={maxChunks}
+            onChange={(event) => setMaxChunks(Number(event.target.value) || 30)}
+          />
+        </div>
+        <div className="col-12 col-md-3">
+          <label className="form-label small mb-1">Model poleceń</label>
+          {modelSelect(instructionModel, setInstructionModel, "Model poleceń")}
+        </div>
+        <div className="col-12 col-md-3">
+          <label className="form-label small mb-1">
+            Model odpowiedzi „rejected”
+          </label>
+          {modelSelect(
+            rejectedModel,
+            setRejectedModel,
+            "Model odpowiedzi rejected",
+          )}
+        </div>
+      </div>
+      <div className="mb-2">
+        <label className="form-label small mb-1">
+          Wskazówki do poleceń (opcjonalnie)
+        </label>
+        <input
+          className="form-control form-control-sm"
+          value={hint}
+          placeholder="Np. polecenie ma prosić o napisanie sceny prozy w stylu autora, z opisem nastroju i bohaterów"
+          onChange={(event) => setHint(event.target.value)}
+        />
+      </div>
+      <div className="mb-3">
+        <label className="form-label small mb-1">
+          Prompt systemowy par (opcjonalnie)
+        </label>
+        <input
+          className="form-control form-control-sm"
+          value={system}
+          placeholder="Pusty = pary bez promptu systemowego"
+          onChange={(event) => setSystem(event.target.value)}
+        />
+      </div>
+      {preview && (
+        <div className="alert alert-light border small">
+          Fragmentów: {preview.total}; w tej partii: {preview.used}. Pierwszy:
+          <pre className="mb-0 mt-1 small text-wrap">
+            {preview.sample[0]?.slice(0, 600)}
+          </pre>
+        </div>
+      )}
+      {status && status.state !== "idle" && (
+        <div
+          className={`alert py-2 small ${status.state === "running" ? "alert-info" : "alert-light border"}`}
+        >
+          {status.state === "running"
+            ? "Generowanie… "
+            : status.state === "cancelled"
+              ? "Przerwano. "
+              : "Gotowe. "}
+          {status.processed ?? 0} / {status.total ?? 0}; zapisano par:{" "}
+          {status.saved ?? 0}
+          {status.errors
+            ? `; błędy: ${status.errors} (${status.last_error ?? ""})`
+            : ""}
+        </div>
+      )}
+      {error && <div className="alert alert-danger py-2">{error}</div>}
+      <div className="d-flex flex-wrap gap-2">
+        <button
+          className="btn btn-outline-secondary"
+          type="button"
+          disabled={text.length < 50}
+          onClick={() =>
+            void run(async () =>
+              setPreview(await api.previewPreferenceChunks(payload())),
+            )
+          }
+        >
+          Podgląd podziału
+        </button>
+        {running ? (
+          <button
+            className="btn btn-outline-danger"
+            type="button"
+            onClick={() =>
+              void run(async () => setStatus(await api.cancelPreferenceBatch()))
+            }
+          >
+            Przerwij
+          </button>
+        ) : (
+          <button
+            className="btn btn-primary"
+            type="button"
+            disabled={text.length < 50 || !instructionModel || !rejectedModel}
+            onClick={() =>
+              void run(async () =>
+                setStatus(await api.startPreferenceBatch(corpusId, payload())),
+              )
+            }
+          >
+            Generuj pary DPO
+          </button>
+        )}
+        <a
+          className="btn btn-outline-primary"
+          href={`/api/corpora/${corpusId}/export-dpo`}
+          download
+        >
+          <Download size={15} className="me-1" /> Eksport DPO JSONL
+          (zaakceptowane)
+        </a>
+      </div>
+    </section>
+  );
+}
+
+const TASK_LABELS: Record<string, string> = {
+  extraction: "ekstrakcja",
+  classification: "klasyfikacja",
+  generation: "generowanie",
+};
+
+function BalanceTable({
+  title,
+  note,
+  nameHeader,
+  rows,
+  pending,
+}: {
+  title: string;
+  note: string;
+  nameHeader: string;
+  rows: AnalysisTypeRow[];
+  pending: Map<string, AnalysisTypeRow>;
+}) {
+  if (!rows.length) return null;
+  return (
+    <>
+      <h2 className="h6">{title}</h2>
+      <p className="small text-secondary mb-2">{note}</p>
+      <div className="table-responsive mb-3">
+        <table className="table table-sm align-middle analysis-table">
+          <thead>
+            <tr>
+              <th>{nameHeader}</th>
+              <th>Razem</th>
+              <th>Poz.</th>
+              <th>Neg.</th>
+              <th>Udział neg.</th>
+              <th>Balans</th>
+              <th>train / val / test</th>
+              <th>Propozycje</th>
+              <th>Ostrzeżenia</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const waiting = pending.get(row.type);
+              return (
+                <tr key={row.type}>
+                  <td>
+                    <code>{row.type}</code>
+                  </td>
+                  <td>{row.total}</td>
+                  <td>{row.positive}</td>
+                  <td>{row.negative}</td>
+                  <td>
+                    {row.negative_share === null
+                      ? "—"
+                      : `${Math.round(row.negative_share * 100)}%`}
+                  </td>
+                  <td>
+                    <BalanceBar {...row} />
+                  </td>
+                  <td>
+                    {row.train} / {row.validation} / {row.test}
+                  </td>
+                  <td>
+                    {waiting
+                      ? `+${waiting.positive} / +${waiting.negative}`
+                      : "—"}
+                  </td>
+                  <td>
+                    {row.warnings.map((warning) => (
+                      <span
+                        className="badge text-bg-warning me-1 mb-1"
+                        key={warning}
+                      >
+                        {warning}
+                      </span>
+                    ))}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
 function CorpusAnalysisView({
   analysis,
   loading,
@@ -1186,6 +1945,11 @@ function CorpusAnalysisView({
   const corpus = scope === "proposals" ? proposals : analysis.corpus;
   const pendingByType = new Map(
     scope === "corpus" ? proposals.types.map((row) => [row.type, row]) : [],
+  );
+  const pendingByLabel = new Map(
+    scope === "corpus"
+      ? (proposals.labels ?? []).map((row) => [row.type, row])
+      : [],
   );
   const issues = Object.entries(corpus.issues).filter(([, item]) => item.count);
   const lengths = corpus.length_tokens;
@@ -1239,6 +2003,18 @@ function CorpusAnalysisView({
             .map(([count, number]) => `${count}× ${number}`)
             .join(", ")}
         </span>
+        {corpus.tasks && (
+          <span
+            className="badge text-bg-light border text-dark"
+            title="Rodzaj zadania wykryty z odpowiedzi (lub zapisany w metadanych przykładu)"
+          >
+            zadania:{" "}
+            {Object.entries(corpus.tasks)
+              .filter(([, count]) => count)
+              .map(([task, count]) => `${TASK_LABELS[task] ?? task} ${count}`)
+              .join(" · ")}
+          </span>
+        )}
         <span
           className={`badge border ${lengths.max_length && lengths.max > lengths.max_length ? "text-bg-warning" : "text-bg-light text-dark"}`}
           title={`Szacunek: ${lengths.estimate_chars_per_token} znaku na token`}
@@ -1343,70 +2119,20 @@ function CorpusAnalysisView({
           </tbody>
         </table>
       </div>
-      <h2 className="h6">Typy encji</h2>
-      <p className="small text-secondary mb-2">
-        Pozytywny liczy się do typów z odpowiedzi, negatywny — do typu, o który
-        pytało polecenie. Kolumna „propozycje” to oczekujące propozycje
-        asystenta (poz./neg.).
-      </p>
-      <div className="table-responsive mb-3">
-        <table className="table table-sm align-middle analysis-table">
-          <thead>
-            <tr>
-              <th>Typ</th>
-              <th>Razem</th>
-              <th>Poz.</th>
-              <th>Neg.</th>
-              <th>Udział neg.</th>
-              <th>Balans</th>
-              <th>train / val / test</th>
-              <th>Propozycje</th>
-              <th>Ostrzeżenia</th>
-            </tr>
-          </thead>
-          <tbody>
-            {corpus.types.map((row) => {
-              const pending = pendingByType.get(row.type);
-              return (
-                <tr key={row.type}>
-                  <td>
-                    <code>{row.type}</code>
-                  </td>
-                  <td>{row.total}</td>
-                  <td>{row.positive}</td>
-                  <td>{row.negative}</td>
-                  <td>
-                    {row.negative_share === null
-                      ? "—"
-                      : `${Math.round(row.negative_share * 100)}%`}
-                  </td>
-                  <td>
-                    <BalanceBar {...row} />
-                  </td>
-                  <td>
-                    {row.train} / {row.validation} / {row.test}
-                  </td>
-                  <td>
-                    {pending
-                      ? `+${pending.positive} / +${pending.negative}`
-                      : "—"}
-                  </td>
-                  <td>
-                    {row.warnings.map((warning) => (
-                      <span
-                        className="badge text-bg-warning me-1 mb-1"
-                        key={warning}
-                      >
-                        {warning}
-                      </span>
-                    ))}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      <BalanceTable
+        title="Typy elementów (ekstrakcja)"
+        note="Pozytywny liczy się do typów z odpowiedzi, negatywny — do typu, o który pytało polecenie. Kolumna „propozycje” to oczekujące propozycje asystenta (poz./neg.)."
+        nameHeader="Typ"
+        rows={corpus.types}
+        pending={pendingByType}
+      />
+      <BalanceTable
+        title="Etykiety (klasyfikacja)"
+        note="Liczność każdej etykiety w odpowiedziach klasyfikacji."
+        nameHeader="Etykieta"
+        rows={corpus.labels ?? []}
+        pending={pendingByLabel}
+      />
       {corpus.warnings.length > 0 && (
         <div className="alert alert-warning py-2">
           <strong className="small d-block mb-1">
@@ -1580,13 +2306,13 @@ function CorporaPage({
       const result = await api.restoreTrash(lastDeletion.trashId);
       setExamples(await loadExamples());
       setLastDeletion(null);
-      setImportNotice(`Przywrócono encje: ${result.restored}.`);
+      setImportNotice(`Przywrócono przykłady: ${result.restored}.`);
       onCorpusUpdated();
     } catch (error) {
       setImportError(
         error instanceof Error
           ? error.message
-          : "Nie udało się przywrócić encji.",
+          : "Nie udało się przywrócić przykładów.",
       );
     } finally {
       setBusy(false);
@@ -1810,7 +2536,8 @@ function CorporaPage({
     setImportError("");
     try {
       const records = parseImportFile(await file.text());
-      if (!records.length) throw new Error("Plik nie zawiera encji JSONL.");
+      if (!records.length)
+        throw new Error("Plik nie zawiera przykładów JSONL.");
       if (isCorpusDto(records)) {
         await saveImportedExamples(records as ImportedExample[]);
         return;
@@ -1856,7 +2583,7 @@ function CorporaPage({
     setFlagFilter("");
     setImportFilter(result.import_id);
     setImportNotice(
-      `Zaimportowano encje: ${result.imported}. Domyślny split: ${importSplit}. Partia: ${result.import_id}.` +
+      `Zaimportowano przykłady: ${result.imported}. Domyślny split: ${importSplit}. Partia: ${result.import_id}.` +
         (skipped.length
           ? ` Pominięto ${skipped.length}: ${skipped.slice(0, 3).join("; ")}${skipped.length > 3 ? "; …" : ""}.`
           : ""),
@@ -1995,7 +2722,7 @@ function CorporaPage({
       setExamples(await api.examples(selectedCorpus?.id ?? ""));
       setManualPromptOpen(false);
       setImportNotice(
-        `Zapisano ręcznie zmieniony system prompt w ${result.updated} encjach. Pominięto jako niezgodne: ${result.skipped}.`,
+        `Zapisano ręcznie zmieniony system prompt w ${result.updated} przykładach. Pominięto jako niezgodne: ${result.skipped}.`,
       );
     } catch (error) {
       setPromptModalError(
@@ -2023,14 +2750,14 @@ function CorporaPage({
       setImportError(
         error instanceof Error
           ? error.message
-          : "Nie udało się zaimportować encji.",
+          : "Nie udało się zaimportować przykładów.",
       );
     } finally {
       setBusy(false);
     }
   }
   async function removeExample(example: Example) {
-    if (!window.confirm("Usunąć tę encję?")) return;
+    if (!window.confirm("Usunąć ten przykład?")) return;
     setBusy(true);
     try {
       const result = await api.deleteExample(example.id);
@@ -2104,7 +2831,7 @@ function CorporaPage({
     if (!selectedExample) return;
     const targetCorpusId = selectedExample.corpus_id ?? corpusId;
     if (asCopy && !targetCorpusId) {
-      setDrawerError("Nie można ustalić korpusu dla kopii encji.");
+      setDrawerError("Nie można ustalić korpusu dla kopii przykładu.");
       return;
     }
     if (
@@ -2145,7 +2872,9 @@ function CorporaPage({
       setEditingMessageIndex(null);
     } catch (error) {
       setDrawerError(
-        error instanceof Error ? error.message : "Nie udało się zapisać encji.",
+        error instanceof Error
+          ? error.message
+          : "Nie udało się zapisać przykładu.",
       );
     } finally {
       setBusy(false);
@@ -2287,7 +3016,7 @@ function CorporaPage({
     if (
       !selectedIds.size ||
       !window.confirm(
-        `Usunąć zaznaczone encje: ${selectedIds.size}?\nKorpus: ${corpusNames.join(", ")}\n\nUsunięcie można cofnąć przyciskiem „Cofnij”.`,
+        `Usunąć zaznaczone przykłady: ${selectedIds.size}?\nKorpus: ${corpusNames.join(", ")}\n\nUsunięcie można cofnąć przyciskiem „Cofnij”.`,
       )
     )
       return;
@@ -2423,7 +3152,7 @@ function CorporaPage({
     >
       <MediumPageTemplate
         eyebrow="PRZEGLĄD"
-        title={`Encje JSONL${selectedCorpus ? `: ${selectedCorpus.name}` : ""}`}
+        title={`Przykłady SFT${selectedCorpus ? `: ${selectedCorpus.name}` : ""}`}
         actions={
           <div className="d-flex flex-column gap-2 align-self-start">
             <div className="d-flex flex-wrap gap-2">
@@ -2492,7 +3221,7 @@ function CorporaPage({
                 disabled={!selectedCorpus}
                 onClick={() => navigate(`/builder/${selectedCorpus?.id}`)}
               >
-                <FilePlus2 size={17} className="me-1" /> Dodaj encję
+                <FilePlus2 size={17} className="me-1" /> Dodaj przykład
               </button>
             </div>
           </div>
@@ -2522,7 +3251,7 @@ function CorporaPage({
         )}
         {lastDeletion && (
           <div className="alert alert-warning d-flex justify-content-between align-items-center gap-2">
-            <span>Usunięto encje: {lastDeletion.count}.</span>
+            <span>Usunięto przykłady: {lastDeletion.count}.</span>
             <span className="d-flex gap-2">
               <button
                 className="btn btn-sm btn-warning"
@@ -2546,7 +3275,7 @@ function CorporaPage({
           <div className="alert alert-success">{importNotice}</div>
         )}
         {importError && <div className="alert alert-danger">{importError}</div>}
-        <nav className="nav nav-tabs mb-3 mt-3" aria-label="Widok encji">
+        <nav className="nav nav-tabs mb-3 mt-3" aria-label="Widok korpusu">
           <button
             className={`nav-link ${activeView === "analysis" ? "active" : ""}`}
             type="button"
@@ -2579,6 +3308,20 @@ function CorporaPage({
               : ""}
           </button>
           <button
+            className={`nav-link ${activeView === "vocabulary" ? "active" : ""}`}
+            type="button"
+            onClick={() => switchView("vocabulary")}
+          >
+            Słownik
+          </button>
+          <button
+            className={`nav-link ${activeView === "dpo" ? "active" : ""}`}
+            type="button"
+            onClick={() => switchView("dpo")}
+          >
+            Pary DPO
+          </button>
+          <button
             className={`nav-link ${activeView === "settings" ? "active" : ""}`}
             type="button"
             onClick={() => switchView("settings")}
@@ -2592,7 +3335,7 @@ function CorporaPage({
               <div className="col-12 col-md">
                 <input
                   className="form-control"
-                  placeholder="Filtruj treść encji"
+                  placeholder="Filtruj treść przykładów"
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
                 />
@@ -2669,8 +3412,8 @@ function CorporaPage({
               <div>
                 <p className="panel-title mb-1">AUTOMATYCZNA KLASYFIKACJA</p>
                 <small className="text-secondary">
-                  Bielik przechodzi kolejno przez nieoznaczone encje z bieżących
-                  filtrów.
+                  Bielik przechodzi kolejno przez nieoznaczone przykłady z
+                  bieżących filtrów.
                 </small>
               </div>
               {classification?.state === "running" ? (
@@ -2711,7 +3454,7 @@ function CorporaPage({
                     onChange={(event) =>
                       setBulkSplit(event.target.value as ExampleSplit)
                     }
-                    aria-label="Docelowy split zaznaczonych encji"
+                    aria-label="Docelowy split zaznaczonych przykładów"
                   >
                     <option value="train">train</option>
                     <option value="validation">validation</option>
@@ -2776,7 +3519,7 @@ function CorporaPage({
               </div>
             )}
             {examplesLoading ? (
-              <div className="text-secondary">Wczytywanie encji...</div>
+              <div className="text-secondary">Wczytywanie przykładów...</div>
             ) : filteredExamples.length ? (
               <div className="list-group shadow-sm">
                 <label className="list-group-item d-flex align-items-center gap-2 entity-select-all">
@@ -2812,7 +3555,7 @@ function CorporaPage({
                       type="checkbox"
                       checked={selectedIds.has(example.id)}
                       onChange={() => toggleSelection(example.id)}
-                      aria-label="Zaznacz encję"
+                      aria-label="Zaznacz przykład"
                     />
                     <button
                       className="entity-select text-start"
@@ -2889,7 +3632,7 @@ function CorporaPage({
               </div>
             ) : (
               <div className="text-secondary">
-                Brak encji dla wybranych filtrów.
+                Brak przykładów dla wybranych filtrów.
               </div>
             )}
           </>
@@ -3002,6 +3745,14 @@ function CorporaPage({
                                   {exchanges} wymiany
                                 </span>
                               )}
+                              {example.metadata.rejected && (
+                                <span
+                                  className="badge text-bg-info"
+                                  title={`rejected (${example.metadata.rejected_model ?? "model"}): ${example.metadata.rejected.slice(0, 300)}`}
+                                >
+                                  para DPO
+                                </span>
+                              )}
                               {!example.messages.some(
                                 (message) => message.role === "system",
                               ) && (
@@ -3052,7 +3803,24 @@ function CorporaPage({
           </section>
         )}
         {corpusId && activeView === "settings" && (
-          <CorpusSettingsView corpusId={corpusId} onSaved={onCorpusUpdated} />
+          <CorpusSettingsView
+            corpusId={corpusId}
+            onSaved={onCorpusUpdated}
+            section="general"
+          />
+        )}
+        {corpusId && activeView === "dpo" && (
+          <PreferenceBatchView
+            corpusId={corpusId}
+            onProgress={() => void reloadExamples()}
+          />
+        )}
+        {corpusId && activeView === "vocabulary" && (
+          <CorpusSettingsView
+            corpusId={corpusId}
+            onSaved={onCorpusUpdated}
+            section="vocabulary"
+          />
         )}
         {corpusId && activeView === "analysis" && (
           <CorpusAnalysisView
@@ -3072,7 +3840,7 @@ function CorporaPage({
                 Unikalne prompty: {systemPromptGroups.length}
               </span>
               <span className="badge text-bg-light border text-dark">
-                Encje z promptem występującym raz: {uniqueSystemPromptCount}
+                Przykłady z promptem występującym raz: {uniqueSystemPromptCount}
               </span>
             </div>
             <div className="d-flex flex-wrap gap-2 mb-3">
@@ -3087,7 +3855,7 @@ function CorporaPage({
                   <div className="list-group-item" key={prompt}>
                     <div className="d-flex justify-content-between gap-3">
                       <div className="text-truncate flex-grow-1">
-                        <strong>{items.length} encji</strong>
+                        <strong>{items.length} przykładów</strong>
                         <small className="d-block text-secondary text-truncate">
                           {prompt}
                         </small>
@@ -3218,7 +3986,7 @@ function CorporaPage({
                     <p className="text-secondary small">
                       {importSession.adapter === "owu-annotations"
                         ? "Wykryto DTO OWU annotations. Importer zbuduje wiadomości z task, labels, text i target."
-                        : "Wybierz klucze wejściowego DTO dla pól encji korpusu. Gdy mapujesz messages, pola ról są ignorowane."}
+                        : "Wybierz klucze wejściowego DTO dla pól przykładów korpusu. Gdy mapujesz messages, pola ról są ignorowane."}
                     </p>
                     {importSession.adapter === "owu-annotations" ? (
                       <div className="alert alert-info mb-0">
@@ -3314,7 +4082,7 @@ function CorporaPage({
                       </div>
                     )}
                     <label className="form-label">
-                      Co którą encję zmienić?
+                      Co który przykład zmienić?
                     </label>
                     <input
                       className="form-control mb-3"
@@ -3334,7 +4102,7 @@ function CorporaPage({
                     <p className="text-secondary">
                       Zmieniony prompt zostanie użyty w około{" "}
                       {Math.floor(manualPromptIds.length / manualEvery)} z{" "}
-                      {manualPromptIds.length} encji tej grupy.
+                      {manualPromptIds.length} przykładów tej grupy.
                     </p>
                     <div className="row g-3 mb-3">
                       <div className="col-12 col-md-6">
@@ -3623,10 +4391,10 @@ function CorporaPage({
               aria-label="Zamknij podgląd"
               onClick={closeDrawer}
             />
-            <aside className="entity-drawer" aria-label="Podgląd encji">
+            <aside className="entity-drawer" aria-label="Podgląd przykładu">
               <div className="entity-drawer-header">
                 <div>
-                  <h2 className="h5 mb-1">Szczegóły encji</h2>
+                  <h2 className="h5 mb-1">Szczegóły przykładu</h2>
                   <small className="text-secondary">
                     {formatCreatedAt(selectedExample.created_at)}
                   </small>
@@ -3743,6 +4511,17 @@ function CorporaPage({
                     onChange={(event) => setFixNote(event.target.value)}
                   />
                 </section>
+              )}
+              {selectedExample.metadata.rejected && (
+                <details className="example-issues dpo-rejected" open>
+                  <summary className="panel-title">
+                    ODPOWIEDŹ ODRZUCONA (DPO REJECTED ·{" "}
+                    {selectedExample.metadata.rejected_model ?? "model"})
+                  </summary>
+                  <p className="mb-0 mt-2" style={{ whiteSpace: "pre-wrap" }}>
+                    {selectedExample.metadata.rejected}
+                  </p>
+                </details>
               )}
               <div className="d-flex flex-wrap gap-2 mb-3">
                 <button
@@ -4100,7 +4879,7 @@ function Builder({ corpora }: { corpora: Corpus[] }) {
   }
   return (
     <PageTemplate
-      eyebrow={editingId ? "EDYCJA ENCJI" : "KONSTRUKCJA KORPUSU"}
+      eyebrow={editingId ? "EDYCJA PRZYKŁADU" : "KONSTRUKCJA KORPUSU"}
       title={selected?.name ?? "Wybierz korpus po lewej"}
       actions={
         <div className="btn-group align-self-start">

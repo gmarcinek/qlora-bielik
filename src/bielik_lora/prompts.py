@@ -19,7 +19,7 @@ def load_sections(filename: str, sections: tuple[str, ...]) -> dict[str, str]:
 
 
 def orchestrator_prompts() -> dict[str, str]:
-    return load_sections("orkiestrator.yml", ("system", "corpus_context", "sandbox", "tool_envelope"))
+    return load_sections("orkiestrator.yml", ("system", "corpus_context", "type_vocabulary", "sandbox", "tool_envelope"))
 
 
 def reader_prompts() -> dict[str, str]:

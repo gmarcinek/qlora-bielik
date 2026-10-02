@@ -36,6 +36,15 @@ from bielik_lora.sandbox_client import SANDBOX_TOOL_NAMES, SANDBOX_TOOLS, Sandbo
 from bielik_lora.large_reader import READ_LARGE_FILE_TOOL, read_large_file_session
 from bielik_lora.evaluation import BASE_CHECKPOINT, precision_recall_f1, score_example, summarize
 from bielik_lora.transforms import transform_messages
+from bielik_lora.preferences import (
+    ANSWER_SCHEMA,
+    INSTRUCTION_SCHEMA,
+    answer_messages,
+    backtranslation_messages,
+    chunk_text,
+    dpo_record,
+    preference_messages,
+)
 from bielik_lora.ollama import chat as ollama_chat
 from bielik_lora.ollama import chat_stream, list_models
 from bielik_lora.ollama import generate
@@ -96,10 +105,25 @@ class SplitRatio(BaseModel):
         return self
 
 
+class EntityTypeDefinition(BaseModel):
+    name: str = Field(min_length=1, max_length=60, pattern=r"^\S(.*\S)?$")
+    definition: str = Field(default="", max_length=1000)
+    boundary: str = Field(default="", max_length=1000, description="Czym ten typ NIE jest (przypadek graniczny).")
+
+
 class CorpusSettings(BaseModel):
     agent_prompt: str = Field(default="", max_length=20000)
     default_model: str | None = Field(default=None, max_length=100)
     split_ratio: SplitRatio = Field(default_factory=SplitRatio)
+    entity_types: list[EntityTypeDefinition] = Field(default_factory=list, max_length=200)
+    max_exchanges: int = Field(default=1, ge=1, le=2)
+
+    @model_validator(mode="after")
+    def unique_type_names(self) -> "CorpusSettings":
+        names = [item.name for item in self.entity_types]
+        if len(names) != len(set(names)):
+            raise ValueError("Nazwy typów w słowniku muszą być unikalne.")
+        return self
 
 
 class ChatRequest(BaseModel):
@@ -2371,6 +2395,160 @@ def export_examples(
     )
 
 
+@app.get("/api/corpora/{corpus_id}/export-dpo")
+def export_preferences(
+    corpus_id: UUID, request: Request, split: Literal["all", "train", "validation", "test", "unassigned"] = "all"
+) -> Response:
+    """Accepted preference pairs (examples with metadata.rejected) in the TRL conversational DPO format."""
+    with request.app.state.pool.connection() as database_connection:
+        result = database_connection.execute(
+            """
+            SELECT messages, metadata->>'rejected' AS rejected FROM training_examples
+            WHERE corpus_id = %s AND metadata ? 'rejected'
+              AND ((%s = 'all' AND split <> 'unassigned') OR split = %s) AND """ + NOT_PROPOSAL + """ ORDER BY created_at
+            """,
+            (corpus_id, split, split),
+        )
+        content = "".join(
+            json.dumps(dpo_record(row["messages"], row["rejected"]), ensure_ascii=False) + "\n" for row in result
+        )
+    return Response(
+        content=content,
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": f'attachment; filename="dpo-{corpus_id}-{split}.jsonl"'},
+    )
+
+
+class ModelChoice(BaseModel):
+    provider: str = Field(min_length=1, max_length=50)
+    model: str = Field(min_length=1, max_length=100)
+
+
+class PreferenceBatch(BaseModel):
+    text: str = Field(min_length=50, max_length=3_000_000)
+    source_name: str = Field(default="dokument", max_length=200)
+    chunk_chars: int = Field(default=1500, ge=300, le=6000)
+    max_chunks: int = Field(default=50, ge=1, le=500)
+    hint: str = Field(default="", max_length=2000)
+    system: str = Field(default="", max_length=20000)
+    instruction_model: ModelChoice
+    rejected_model: ModelChoice
+
+
+PREFERENCE_LOCK = threading.Lock()
+PREFERENCE_JOB: dict = {"state": "idle"}
+
+
+def preference_batch_job(pool: ConnectionPool, corpus_id: UUID, chunks: list[str], payload: PreferenceBatch, batch: str) -> None:
+    """Each chunk: back-translated instruction, chunk as the chosen answer, rejected model's answer; saved as proposals."""
+    for index, chunk in enumerate(chunks):
+        with PREFERENCE_LOCK:
+            if PREFERENCE_JOB.get("cancel"):
+                PREFERENCE_JOB["state"] = "cancelled"
+                return
+        try:
+            instruction = parse_model_json_field(
+                paraphrase_chat(
+                    backtranslation_messages(chunk, payload.hint),
+                    INSTRUCTION_SCHEMA,
+                    payload.instruction_model.provider,
+                    payload.instruction_model.model,
+                ),
+                "instruction",
+            )
+            rejected = parse_model_json_field(
+                paraphrase_chat(
+                    answer_messages(instruction, payload.system),
+                    ANSWER_SCHEMA,
+                    payload.rejected_model.provider,
+                    payload.rejected_model.model,
+                ),
+                "answer",
+            )
+            with pool.connection() as database_connection:
+                with database_connection.transaction():
+                    database_connection.execute(
+                        """
+                        INSERT INTO training_examples (corpus_id, split, messages, source, metadata)
+                        VALUES (%s, %s, %s::jsonb, %s, %s::jsonb)
+                        """,
+                        (
+                            corpus_id,
+                            "train",
+                            json.dumps(preference_messages(instruction, chunk, payload.system), ensure_ascii=False),
+                            f"dpo:{payload.source_name}"[:200],
+                            json.dumps(
+                                {
+                                    "flag": PROPOSAL_FLAG,
+                                    "proposed_flag": "positive",
+                                    "import_id": batch,
+                                    "task": "generation",
+                                    "rejected": rejected,
+                                    "rejected_model": payload.rejected_model.model,
+                                    "chunk_index": index,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
+            with PREFERENCE_LOCK:
+                PREFERENCE_JOB["saved"] += 1
+        except (RuntimeError, OSError, HTTPException) as error:
+            with PREFERENCE_LOCK:
+                PREFERENCE_JOB["errors"] += 1
+                PREFERENCE_JOB["last_error"] = str(getattr(error, "detail", error))[:500]
+        with PREFERENCE_LOCK:
+            PREFERENCE_JOB["processed"] = index + 1
+    with PREFERENCE_LOCK:
+        PREFERENCE_JOB["state"] = "completed"
+
+
+@app.post("/api/corpora/{corpus_id}/preference-batches")
+def start_preference_batch(corpus_id: UUID, payload: PreferenceBatch, request: Request) -> dict:
+    for choice in (payload.instruction_model, payload.rejected_model):
+        config = paraphrase_provider_config()["models"].get(choice.model)
+        if not isinstance(config, dict) or config.get("provider") != choice.provider:
+            raise HTTPException(status_code=422, detail=f"Model {choice.model} nie jest skonfigurowany dla {choice.provider}.")
+    with request.app.state.pool.connection() as database_connection:
+        corpus_settings(database_connection, corpus_id)
+    chunks = chunk_text(payload.text, payload.chunk_chars)[: payload.max_chunks]
+    if not chunks:
+        raise HTTPException(status_code=422, detail="Tekst nie zawiera fragmentów do podziału.")
+    batch = f"dpo-{uuid4()}"
+    with PREFERENCE_LOCK:
+        if PREFERENCE_JOB.get("state") == "running":
+            raise HTTPException(status_code=409, detail="Generowanie par DPO już trwa.")
+        PREFERENCE_JOB.clear()
+        PREFERENCE_JOB.update(
+            state="running", corpus_id=str(corpus_id), batch=batch, total=len(chunks),
+            processed=0, saved=0, errors=0, last_error=None, cancel=False,
+        )
+    threading.Thread(
+        target=preference_batch_job, args=(request.app.state.pool, corpus_id, chunks, payload, batch), daemon=True
+    ).start()
+    return preference_batch_status()
+
+
+@app.get("/api/preference-batches/status")
+def preference_batch_status() -> dict:
+    with PREFERENCE_LOCK:
+        return {key: value for key, value in PREFERENCE_JOB.items() if key != "cancel"}
+
+
+@app.post("/api/preference-batches/cancel")
+def cancel_preference_batch() -> dict:
+    with PREFERENCE_LOCK:
+        if PREFERENCE_JOB.get("state") == "running":
+            PREFERENCE_JOB["cancel"] = True
+    return preference_batch_status()
+
+
+@app.post("/api/preference-batches/preview")
+def preview_chunks(payload: PreferenceBatch) -> dict:
+    chunks = chunk_text(payload.text, payload.chunk_chars)
+    return {"total": len(chunks), "used": min(len(chunks), payload.max_chunks), "sample": chunks[:3]}
+
+
 AGENT_PROVIDERS = {"openai", "anthropic"}
 WORKSPACE_LISTING_LIMIT = 60
 PROPOSAL_FLAG = "proposal"
@@ -2432,7 +2610,7 @@ def corpus_analysis(corpus_id: UUID, request: Request) -> dict:
         rows = database_connection.execute(
             """
             SELECT id, split, messages, metadata->>'flag' AS flag, metadata->>'proposed_flag' AS proposed_flag,
-                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces
+                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces, metadata->>'task' AS task
             FROM training_examples WHERE corpus_id = %s ORDER BY created_at
             """,
             (corpus_id,),
@@ -2440,17 +2618,31 @@ def corpus_analysis(corpus_id: UUID, request: Request) -> dict:
     corpus_rows, pending = split_proposals(rows)
     max_tokens = training_max_tokens()
     with request.app.state.pool.connection() as database_connection:
-        split_target = corpus_settings(database_connection, corpus_id)["split_ratio"]
+        settings = corpus_settings(database_connection, corpus_id)
+    vocabulary = type_vocabulary(settings)
     return {
-        "corpus": analyze_corpus(corpus_rows, max_tokens),
-        "proposals": analyze_corpus(pending, max_tokens),
-        "split_target": split_target,
+        "corpus": analyze_corpus(corpus_rows, max_tokens, vocabulary=vocabulary),
+        "proposals": analyze_corpus(pending, max_tokens, vocabulary=vocabulary),
+        "split_target": settings["split_ratio"],
         "unassigned": sum(1 for row in rows if row["split"] == UNASSIGNED_SPLIT and row["flag"] != PROPOSAL_FLAG),
     }
 
 
 class DraftMessages(BaseModel):
     messages: list[dict[str, str]] = Field(max_length=200)
+
+
+def type_vocabulary(settings: dict) -> set[str] | None:
+    return {item["name"] for item in settings.get("entity_types") or []} or None
+
+
+def vocabulary_prompt(settings: dict) -> str:
+    lines = [
+        f"- {item['name']}: {item['definition'] or '(bez definicji)'}"
+        + (f" NIE jest nim: {item['boundary']}" if item.get("boundary") else "")
+        for item in settings.get("entity_types") or []
+    ]
+    return "\n".join(lines)
 
 
 @app.get("/api/examples/{example_id}/issues")
@@ -2462,14 +2654,16 @@ def issues_for_example(example_id: UUID, request: Request, draft: DraftMessages 
     with request.app.state.pool.connection() as database_connection:
         rows = database_connection.execute(
             """
-            SELECT id, split, messages, metadata->>'flag' AS flag, metadata->>'proposed_flag' AS proposed_flag,
-                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces
+            SELECT id, corpus_id, split, messages, metadata->>'flag' AS flag, metadata->>'proposed_flag' AS proposed_flag,
+                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces, metadata->>'task' AS task
             FROM training_examples
             WHERE corpus_id = (SELECT corpus_id FROM training_examples WHERE id = %s)
             ORDER BY created_at
             """,
             (example_id,),
         ).fetchall()
+        corpus_id = rows[0]["corpus_id"] if rows else None
+        settings = corpus_settings(database_connection, corpus_id) if corpus_id else {}
     corpus_rows, pending = split_proposals(rows)
     # A proposal is checked against the corpus it would join, not against other proposals.
     proposal = next((row for row in pending if str(row["id"]) == str(example_id)), None)
@@ -2479,7 +2673,7 @@ def issues_for_example(example_id: UUID, request: Request, draft: DraftMessages 
     rows = corpus_rows + ([proposal] if proposal else [])
     if draft is not None:
         rows = [{**row, "messages": draft.messages} if str(row["id"]) == str(example_id) else row for row in rows]
-    return example_issues(rows, str(example_id), training_max_tokens())
+    return example_issues(rows, str(example_id), training_max_tokens(), type_vocabulary(settings))
 
 
 @app.post("/api/examples/{example_id}/issues")
@@ -2513,6 +2707,7 @@ def save_proposals(request: Request, corpus_id: UUID, drafts: list[dict], source
                                     "proposed_flag": draft["flag"],
                                     "import_id": batch,
                                     **({"replaces": draft["replaces"]} if draft.get("replaces") else {}),
+                                    **({"task": draft["task"]} if draft.get("task") else {}),
                                 }
                             ),
                         )
@@ -2536,9 +2731,17 @@ def apply_proposal_changes(request: Request, corpus_id: UUID, event: dict | None
                         UPDATE training_examples
                         SET messages = %s::jsonb, split = %s,
                             metadata = metadata || jsonb_build_object('proposed_flag', %s::text, 'revised_at', now())
+                                || jsonb_strip_nulls(jsonb_build_object('task', %s::text))
                         WHERE id = %s AND corpus_id = %s AND metadata->>'flag' = 'proposal'
                         """,
-                        (json.dumps(item["messages"], ensure_ascii=False), item["split"], item["flag"], item["id"], corpus_id),
+                        (
+                            json.dumps(item["messages"], ensure_ascii=False),
+                            item["split"],
+                            item["flag"],
+                            item.get("task"),
+                            item["id"],
+                            corpus_id,
+                        ),
                     ).rowcount
                 return {"written": written}
             ids = [
@@ -2603,14 +2806,19 @@ def agent_chat(payload: AgentChat, request: Request) -> StreamingResponse:
         rows = database_connection.execute(
             """
             SELECT id, split, messages, metadata->>'flag' AS flag, metadata->>'proposed_flag' AS proposed_flag,
-                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces
+                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces, metadata->>'task' AS task
             FROM training_examples WHERE corpus_id = %s ORDER BY created_at
             """,
             (payload.corpus_id,),
         ).fetchall()
     corpus_rows, pending_rows = split_proposals(rows)
     tools = CorpusAgentTools(
-        corpus_rows, pending=pending_rows, max_tokens=training_max_tokens(), split_ratio=settings["split_ratio"]
+        corpus_rows,
+        pending=pending_rows,
+        max_tokens=training_max_tokens(),
+        split_ratio=settings["split_ratio"],
+        vocabulary=settings["entity_types"],
+        max_exchanges=settings["max_exchanges"],
     )
     messages = [message.model_dump() for message in payload.messages]
     session_id = str(payload.conversation_id) if payload.conversation_id else None
@@ -2653,6 +2861,11 @@ def agent_chat(payload: AgentChat, request: Request) -> StreamingResponse:
             *(
                 [prompts["corpus_context"].replace("{corpus_prompt}", settings["agent_prompt"].strip())]
                 if settings["agent_prompt"].strip()
+                else []
+            ),
+            *(
+                [prompts["type_vocabulary"].replace("{types}", vocabulary_prompt(settings))]
+                if settings["entity_types"]
                 else []
             ),
             *([prompts["sandbox"] + session_files] if session_id else []),
@@ -2757,6 +2970,19 @@ def download_agent_file(session_id: UUID, path: str) -> Response:
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@app.get("/api/agent/sessions/{session_id}/preview")
+def preview_agent_file(session_id: UUID, path: str) -> Response:
+    content_type, body = sandbox_call(lambda: sandbox.preview(str(session_id), path))
+    allowed = ("application/json", "application/pdf", "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp")
+    media_type = next((kind for kind in allowed if content_type.startswith(kind)), "application/octet-stream")
+    # Inline but sandboxed so a previewed file never runs script in the app's origin; Chrome's PDF viewer refuses
+    # to render under CSP sandbox, and PDFs are shown by the browser viewer, not as app documents.
+    headers = {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"}
+    if media_type != "application/pdf":
+        headers["Content-Security-Policy"] = "sandbox"
+    return Response(body, media_type=media_type, headers=headers)
 
 
 @app.put("/api/agent/sessions/{session_id}/files")

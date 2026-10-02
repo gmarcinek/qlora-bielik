@@ -10,6 +10,8 @@ from typing import Any
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from sandbox.preview import PreviewError
+from sandbox.preview import preview as build_preview
 from sandbox.workspace import SandboxError, Workspace
 
 TOKEN = os.getenv("SANDBOX_TOKEN", "")
@@ -72,3 +74,16 @@ def download(session_id: str, path: str) -> FileResponse:
     session = workspace.session(session_id)
     session.meta()
     return FileResponse(session.existing_file(path))
+
+
+@app.get("/sessions/{session_id}/preview", response_model=None)
+def preview_file(session_id: str, path: str) -> FileResponse | dict[str, Any]:
+    session = workspace.session(session_id)
+    session.meta()
+    try:
+        result = build_preview(session.existing_file(path))
+    except PreviewError as error:
+        raise SandboxError(str(error), 422) from error
+    if "file" in result:
+        return FileResponse(result["file"], media_type=result["media_type"], headers={"X-Preview-Kind": result["kind"]})
+    return result

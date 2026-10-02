@@ -2,10 +2,18 @@ export type SplitRatio = { train: number; validation: number; test: number };
 
 export type ExampleIssue = { check: string; label: string; detail: string };
 
+export type EntityTypeDefinition = {
+  name: string;
+  definition: string;
+  boundary: string;
+};
+
 export type CorpusSettings = {
   agent_prompt: string;
   default_model: string | null;
   split_ratio: SplitRatio;
+  entity_types?: EntityTypeDefinition[];
+  max_exchanges?: number;
 };
 
 export type Corpus = {
@@ -28,6 +36,8 @@ export type Example = {
     flag?: ExampleFlag | "proposal";
     proposed_flag?: "positive" | "negative";
     replaces?: string;
+    rejected?: string;
+    rejected_model?: string;
     import_id?: string;
   };
 };
@@ -52,6 +62,8 @@ export type CorpusAnalysisPart = {
   splits: Record<string, FlagCounts>;
   flags: FlagCounts;
   types: AnalysisTypeRow[];
+  labels?: AnalysisTypeRow[];
+  tasks?: Record<string, number>;
   warnings: string[];
   system_prompt: { with: number; without: number };
   exchanges: Record<string, number>;
@@ -386,6 +398,30 @@ export type ClassificationStatus = {
   error: string | null;
 };
 
+export type ModelChoice = { provider: string; model: string };
+
+export type PreferenceBatchRequest = {
+  text: string;
+  source_name: string;
+  chunk_chars: number;
+  max_chunks: number;
+  hint: string;
+  system: string;
+  instruction_model: ModelChoice;
+  rejected_model: ModelChoice;
+};
+
+export type PreferenceBatchStatus = {
+  state: "idle" | "running" | "completed" | "cancelled";
+  corpus_id?: string;
+  batch?: string;
+  total?: number;
+  processed?: number;
+  saved?: number;
+  errors?: number;
+  last_error?: string | null;
+};
+
 export type ParaphraseProviderCatalog = {
   providers: Record<
     string,
@@ -441,6 +477,22 @@ export const api = {
     request<{ prompt: string }>("/api/system-prompts/paraphraser"),
   paraphraseProviders: () =>
     request<ParaphraseProviderCatalog>("/api/paraphrase/providers"),
+  previewPreferenceChunks: (payload: PreferenceBatchRequest) =>
+    request<{ total: number; used: number; sample: string[] }>(
+      "/api/preference-batches/preview",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  startPreferenceBatch: (corpusId: string, payload: PreferenceBatchRequest) =>
+    request<PreferenceBatchStatus>(
+      `/api/corpora/${corpusId}/preference-batches`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  preferenceBatchStatus: () =>
+    request<PreferenceBatchStatus>("/api/preference-batches/status"),
+  cancelPreferenceBatch: () =>
+    request<PreferenceBatchStatus>("/api/preference-batches/cancel", {
+      method: "POST",
+    }),
   compareSystemPrompts: (
     original: string,
     candidate: string,

@@ -317,6 +317,25 @@ class SandboxClient:
         query = parse.urlencode({"path": path, "unique": "true" if unique else "false"})
         return self.request("PUT", f"/sessions/{session_id}/files?{query}", data=data, timeout=300)
 
+    def preview(self, session_id: str, path: str) -> tuple[str, bytes]:
+        """(content type, body): JSON for text-like previews, the file itself for images and PDFs."""
+        http_request = request.Request(
+            f"{self.base_url}/sessions/{session_id}/preview?{parse.urlencode({'path': path})}",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        try:
+            with request.urlopen(http_request, timeout=240) as response:
+                return response.headers.get("Content-Type", "application/octet-stream"), response.read()
+        except error.HTTPError as http_error:
+            raw = http_error.read().decode("utf-8", errors="replace")
+            try:
+                raw = str(json.loads(raw).get("detail", raw))
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            raise RuntimeError(raw) from http_error
+        except error.URLError as url_error:
+            raise RuntimeError(f"Sandbox niedostępny: {url_error.reason}") from url_error
+
     def download(self, session_id: str, path: str) -> bytes:
         http_request = request.Request(
             f"{self.base_url}/sessions/{session_id}/files?{parse.urlencode({'path': path})}",

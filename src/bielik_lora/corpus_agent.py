@@ -8,8 +8,17 @@ from collections import Counter
 from typing import Any
 
 from bielik_lora.agent import CONTEXT_LIMIT_CHARS, ToolError
-from bielik_lora.corpus_analysis import analyze, balance_summary, minimal_summary
-from bielik_lora.evaluation import answer_items, parse_answer
+from bielik_lora.corpus_analysis import (
+    LABEL_KEYS,
+    MAX_LABEL_CHARS,
+    TASKS,
+    analyze,
+    balance_summary,
+    classification_label,
+    detect_task,
+    minimal_summary,
+)
+from bielik_lora.evaluation import LIST_FIELDS, answer_items, parse_answer
 
 MAX_PROPOSALS_PER_CALL = 20
 MAX_EXCHANGES = 2
@@ -18,11 +27,11 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "corpus_balance",
         "description": (
-            "Stan korpusu. Domyślnie (detail=summary) minimalna metryka: udział % i liczność splitów train/validation/test "
+            "Stan korpusu. Domyślnie (detail=summary) minimalna metryka: rozkład rodzajów zadań (tasks), udział % i liczność splitów train/validation/test "
             "oraz które przykłady są wadliwe (liczba i id per kontrola: JSON, klucze, sprzeczna flaga, cytat spoza tekstu, typ inny niż w poleceniu, "
-            "za długie, przeciek train/validation, duplikaty), plus liczba ostrzeżeń zbalansowania. "
-            "detail=full: pełna tabela typów encji (pozytywne/negatywne/splity, udział negatywów, ostrzeżenia), długości, system prompty — "
-            "tylko gdy planujesz generowanie pod luki typów albo użytkownik pyta o szczegóły. Osobno to samo dla oczekujących propozycji."
+            "spoza słownika, za długie, przeciek train/validation, duplikaty), plus liczba ostrzeżeń zbalansowania. "
+            "detail=full: tabele typów elementów (ekstrakcja) i etykiet (klasyfikacja) z pozytywami/negatywami/splitami i ostrzeżeniami, długości, system prompty — "
+            "tylko gdy planujesz generowanie pod luki albo użytkownik pyta o szczegóły. Osobno to samo dla oczekujących propozycji."
         ),
         "parameters": {
             "type": "object",
@@ -68,6 +77,16 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "examples_without_system_prompt": {"type": "integer"},
+                "tasks": {
+                    "type": "object",
+                    "description": "Liczba przykładów wg rodzaju zadania (extraction / classification / generation).",
+                    "additionalProperties": {"type": "integer"},
+                },
+                "labels": {
+                    "type": "object",
+                    "description": "Rozkład etykiet w przykładach klasyfikacji.",
+                    "additionalProperties": {"type": "integer"},
+                },
                 "exchanges": {
                     "type": "object",
                     "description": "Liczba przykładów wg liczby wymian user+assistant (np. {\"1\": 845, \"2\": 45}).",
@@ -140,6 +159,15 @@ TOOLS: list[dict[str, Any]] = [
                                 "additionalProperties": False,
                             },
                             "flag": {"type": "string", "enum": ["positive", "negative"]},
+                            "task": {
+                                "type": "string",
+                                "enum": list(TASKS),
+                                "description": (
+                                    "Rodzaj zadania: extraction (JSON z listą elementów), classification (etykieta lub JSON z kluczem label), "
+                                    "generation (swobodny tekst: instrukcje, definicje, odpowiedzi na pytania, przekształcenia). "
+                                    "Pominięty = wykryty z odpowiedzi."
+                                ),
+                            },
                             "split": {
                                 "type": "string",
                                 "enum": ["train", "validation", "test"],
@@ -197,6 +225,7 @@ PROPOSAL_EXAMPLE_PROPERTIES = {
         "properties": {"user": {"type": "string"}, "assistant": {"type": "string"}},
     },
     "flag": {"type": "string", "enum": ["positive", "negative"]},
+    "task": {"type": "string", "enum": list(TASKS)},
     "split": {"type": "string", "enum": ["train", "validation", "test"]},
 }
 
@@ -359,14 +388,19 @@ class CorpusAgentTools:
         pending: list[dict[str, Any]] | None = None,
         max_tokens: int | None = None,
         split_ratio: dict[str, int] | None = None,
+        vocabulary: list[dict[str, str]] | None = None,
+        max_exchanges: int = MAX_EXCHANGES,
     ) -> None:
         self.split_ratio = split_ratio
+        self.max_exchanges = max_exchanges
+        self.vocabulary = {str(item["name"]) for item in vocabulary or []} or None
         self.split_counts = Counter(row["split"] for row in [*rows, *(pending or [])])
         self.rows = rows
         self.pending = pending or []
         self.replaced = {str(row["replaces"]) for row in self.pending if row.get("replaces")}
         self.max_tokens = max_tokens
         self.profile = answer_profile(rows)
+        self.corpus_tasks = Counter(analyze(rows, max_tokens, listed=0, vocabulary=self.vocabulary)["tasks"])
         # Pending proposals do not shape the corpus profile but still count as duplicates.
         self.known_users = {message_text(row["messages"], "user").strip() for row in [*rows, *self.pending]}
         self.system_prompts = Counter(
@@ -396,16 +430,19 @@ class CorpusAgentTools:
         view = balance_summary if detail == "full" else minimal_summary
         return {
             "detail": detail,
-            "corpus": view(analyze(self.rows, self.max_tokens)),
-            "proposals": view(analyze(self.pending, self.max_tokens)),
+            "corpus": view(analyze(self.rows, self.max_tokens, vocabulary=self.vocabulary)),
+            "proposals": view(analyze(self.pending, self.max_tokens, vocabulary=self.vocabulary)),
             "split_target": self.split_ratio,
         }
 
     def overview(self) -> dict[str, Any]:
         counts = Counter(f"{row['split']}/{row.get('flag') or 'unclassified'}" for row in self.rows)
         types = Counter(entity_type for row in self.rows for entity_type in entity_types(row["messages"]))
+        analysis = analyze(self.rows, self.max_tokens, listed=0, vocabulary=self.vocabulary)
         return {
             "examples": len(self.rows),
+            "tasks": analysis["tasks"],
+            "labels": {row["type"]: row["total"] for row in analysis["labels"]},
             "split_flag_counts": dict(sorted(counts.items())),
             "answer_format": self.profile,
             "entity_types": dict(types.most_common()),
@@ -471,6 +508,7 @@ class CorpusAgentTools:
         rows_by_id = {str(row["id"]): row for row in self.rows}
         warnings: list[dict[str, Any]] = []
         for index, example in enumerate(examples[:MAX_PROPOSALS_PER_CALL]):
+            example = self.limit_exchanges(example, index, warnings)
             replaces = str(example.get("replaces") or "").strip() or None
             original = rows_by_id.get(replaces) if replaces else None
             if replaces and original is None:
@@ -504,6 +542,7 @@ class CorpusAgentTools:
                     **exchanges[0],
                     "turns": exchanges[1:],
                     "flag": example["flag"],
+                    "task": example.get("task"),
                     "split": example.get("split") or (original["split"] if original else self.next_split()),
                     "replaces": replaces,
                 }
@@ -530,6 +569,7 @@ class CorpusAgentTools:
             **(pairs[0] if pairs else {"user": "", "assistant": ""}),
             "followup": pairs[1] if len(pairs) > 1 else None,
             "replaces": row.get("replaces"),
+            "task": row.get("task"),
         }
 
     def list_proposals(self, query: str = "", batch: str | None = None, limit: int = 50) -> dict[str, Any]:
@@ -550,6 +590,12 @@ class CorpusAgentTools:
             proposals.append(view)
         return {"matched": len(matches), "returned": len(proposals), "proposals": proposals}
 
+    def limit_exchanges(self, example: dict[str, Any], index: int, warnings: list[dict[str, Any]]) -> dict[str, Any]:
+        if self.max_exchanges > 1 or len(exchanges_of(example)) == 1:
+            return example
+        warnings.append({"index": index, "warning": "Pominięto followup: korpus ma ustawioną jedną wymianę (user + assistant)."})
+        return {key: value for key, value in example.items() if key != "followup"}
+
     def update_proposals(self, updates: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any] | None]:
         by_id = {str(row["id"]): row for row in self.pending}
         changed: list[dict[str, Any]] = []
@@ -564,6 +610,7 @@ class CorpusAgentTools:
             example = {**current, **{key: value for key, value in update.items() if key != "id"}}
             if not isinstance(example.get("followup"), dict):
                 example.pop("followup", None)
+            example = self.limit_exchanges(example, index, warnings)
             original_user = current["user"].strip()
             replaced_row = next((item for item in self.rows if str(item["id"]) == str(row.get("replaces"))), None)
             replaced_user = message_text(replaced_row["messages"], "user").strip() if replaced_row else None
@@ -583,8 +630,15 @@ class CorpusAgentTools:
             ]
             draft = {"system": str(example.get("system") or "").strip(), **exchanges[0], "turns": exchanges[1:]}
             self.known_users.add(exchanges[0]["user"])
-            row.update(messages=draft_messages(draft), flag=example["flag"], split=example.get("split") or row["split"])
-            changed.append({"id": str(row["id"]), "messages": row["messages"], "flag": row["flag"], "split": row["split"]})
+            row.update(
+                messages=draft_messages(draft),
+                flag=example["flag"],
+                split=example.get("split") or row["split"],
+                task=example.get("task") or row.get("task"),
+            )
+            changed.append(
+                {"id": str(row["id"]), "messages": row["messages"], "flag": row["flag"], "split": row["split"], "task": row["task"]}
+            )
             if warning := self.missing_keys_warning(example):
                 warnings.append({"index": index, "warning": warning})
         result = {"updated": len(changed), "rejected": rejected, **({"warnings": warnings} if warnings else {})}
@@ -600,7 +654,9 @@ class CorpusAgentTools:
     def missing_keys_warning(self, example: dict[str, Any]) -> str | None:
         """Keys most corpus answers have; a hint only — the example's own schema (e.g. its system prompt) wins."""
         answer = json_object(str(exchanges_of(example)[-1].get("assistant") or ""))
-        missing = [key for key in self.profile["common_keys"] if answer is not None and key not in answer]
+        if answer is None or detect_task("", answer, example.get("task"), self.vocabulary) != "extraction":
+            return None
+        missing = [key for key in self.profile["common_keys"] if key not in answer]
         return f"Brak kluczy częstych w korpusie: {', '.join(missing)} (przyjęto mimo to)." if missing else None
 
     def park_examples(self, ids: list[str]) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -620,31 +676,58 @@ class CorpusAgentTools:
             where = "" if number == 1 else " (followup)"
             if not str(exchange.get("user") or "").strip():
                 return f"Puste pole user{where}."
-            reason = self.validate_answer(str(exchange.get("assistant") or ""), example.get("flag") if number == len(exchanges) else None)
+            last = number == len(exchanges)
+            reason = self.validate_answer(
+                str(exchange.get("assistant") or ""), example.get("flag") if last else None, example.get("task") if last else None
+            )
             if reason:
                 return reason + where
         return None
 
-    def validate_answer(self, text: str, flag: str | None) -> str | None:
+    def validate_answer(self, text: str, flag: str | None, task: str | None = None) -> str | None:
+        """Checks depend on the task kind (given or detected): extraction needs the JSON list format, classification
+        a label (from the vocabulary if set), generation only a non-empty answer."""
         if not text.strip():
             return "Pusta odpowiedź assistant."
-        if self.profile["json_share"] < 0.5:
+        answer = json_object(text)
+        if text.strip().startswith("{") and answer is None:
+            return "Odpowiedź wygląda na JSON, ale nie jest poprawnym obiektem JSON."
+        explicit = task
+        task = detect_task(text, answer, task, self.vocabulary)
+        if explicit is None and task != "extraction" and self.corpus_tasks[task] == 0 and self.corpus_tasks["extraction"]:
+            # Single-task corpora: a stray plain-text answer is more likely a format mistake than a new task.
+            return (
+                f"Korpus nie ma jeszcze przykładów typu {task} (odpowiedzi to JSON z listą elementów). "
+                f"Jeśli to zamierzone nowe zadanie, podaj task: \"{task}\"; inaczej odpowiedz w formacie korpusu."
+            )
+        if task == "classification":
+            label = classification_label(text, answer, self.vocabulary)
+            if not label:
+                if answer is not None:
+                    return f"Klasyfikacja: brak etykiety (klucz jeden z: {', '.join(LABEL_KEYS)})."
+                if self.vocabulary:
+                    return f"Klasyfikacja: odpowiedź musi być jedną z etykiet: {', '.join(sorted(self.vocabulary))}."
+                if len(text.strip()) > MAX_LABEL_CHARS:
+                    return "Klasyfikacja: odpowiedź tekstowa ma być samą etykietą (lub JSON z kluczem label)."
+            elif self.vocabulary and label not in self.vocabulary:
+                return f"Etykieta spoza słownika korpusu: {label}. Dozwolone: {', '.join(sorted(self.vocabulary))}."
             return None
-        try:
-            answer = json.loads(text)
-        except json.JSONDecodeError as decode_error:
-            return f"Korpus używa odpowiedzi JSON, a assistant nie jest poprawnym JSON-em: {decode_error.msg}."
-        if not isinstance(answer, dict):
-            return "assistant musi być obiektem JSON, jak w korpusie."
-        if not self.profile["entity_list"]:
+        if task != "extraction":
             return None
-        if not isinstance(answer.get("entities", answer.get("exclusions")), list):
-            return "Lista elementów (entities) musi być tablicą, jak w korpusie."
+        if answer is None:
+            return "Ekstrakcja: odpowiedź musi być obiektem JSON z listą elementów (np. entities)."
+        if not any(isinstance(answer.get(field), list) for field in LIST_FIELDS):
+            return f"Ekstrakcja: lista elementów ({' / '.join(LIST_FIELDS)}) musi być tablicą."
         items = answer_items(answer)
         if any(not item.get("type") for item in items):
             return "Każdy element listy musi mieć pole type, jak w korpusie."
+        if self.vocabulary and (outside := sorted({str(item["type"]) for item in items} - self.vocabulary)):
+            return (
+                f"Typ spoza słownika korpusu: {', '.join(outside)}. Dozwolone: {', '.join(sorted(self.vocabulary))} "
+                "(podkategorię opisz w name/description, nie w type)."
+            )
         if flag == "negative" and items:
-            return "Przykład negatywny w tym korpusie ma pustą listę elementów."
+            return "Ekstrakcja: przykład negatywny ma pustą listę elementów."
         if flag == "positive" and not items:
-            return "Przykład pozytywny w tym korpusie zawiera co najmniej jeden element."
+            return "Ekstrakcja: przykład pozytywny zawiera co najmniej jeden element."
         return None

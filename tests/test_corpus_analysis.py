@@ -120,3 +120,55 @@ def test_park_examples_moves_only_accepted_corpus_examples():
     assert result == {"moved": 1, "unknown": ["99", "nope"]}
     assert event == {"type": "examples_parked", "ids": ["1"]}
     assert all(str(item["id"]) != "1" for item in tools.rows)
+
+
+def test_type_vocabulary_rejects_and_flags_types_outside_it():
+    vocabulary = [{"name": "EXCLUSION", "definition": "wy\u0142\u0105czenie", "boundary": ""}]
+    analysis = analyze(ROWS, vocabulary={"EXCLUSION"})
+    assert [entry["id"] for entry in analysis["issues"]["unknown_type"]["examples"]] == ["8"]
+    assert "spoza s\u0142ownika" in next(row for row in analysis["types"] if row["type"] == "NIP")["warnings"]
+    tools = CorpusAgentTools(ROWS, vocabulary=vocabulary)
+    answer = json.dumps({"entities": [{"type": "CHOROBA", "dow\u00f3d": "x"}], "summary": "s"}, ensure_ascii=False)
+    result, _ = tools.propose([{"user": "Nowy fragment o chorobach.", "assistant": answer, "flag": "positive"}])
+    assert result["accepted"] == 0 and "CHOROBA" in result["rejected"][0]["reason"]
+
+
+def plain(index, user, answer, flag="positive", split="train", task=None):
+    messages = [{"role": "user", "content": user}, {"role": "assistant", "content": answer}]
+    return {"id": index, "split": split, "flag": flag, "messages": messages, **({"task": task} if task else {})}
+
+
+def test_mixed_tasks_get_task_specific_checks_only():
+    rows = [
+        *ROWS,
+        plain(20, "Czym jest wy\u0142\u0105czenie odpowiedzialno\u015bci?", "To sytuacja, w kt\u00f3rej ubezpieczyciel nie wyp\u0142aca \u015bwiadczenia."),
+        plain(21, "Sklasyfikuj: lumbago", '{"label": "CHOROBA"}'),
+        plain(22, "Sklasyfikuj: nurkowanie", "SPORT", task="classification"),
+    ]
+    analysis = analyze(rows, vocabulary={"EXCLUSION", "NIP", "CHOROBA"})
+    assert analysis["tasks"] == {"extraction": len(ROWS), "classification": 2, "generation": 1}
+    assert {row["type"] for row in analysis["labels"]} == {"CHOROBA", "SPORT"}
+    assert analysis["issues"]["unknown_type"]["examples"][-1] == {"id": "22", "detail": "etykieta: SPORT"}
+    flagged = {entry["id"] for item in analysis["issues"].values() for entry in item["examples"]}
+    assert "20" not in flagged and "21" not in flagged
+
+
+def test_agent_accepts_new_task_only_when_declared():
+    tools = CorpusAgentTools(ROWS, vocabulary=[{"name": "EXCLUSION", "definition": "", "boundary": ""}, {"name": "CHOROBA", "definition": "", "boundary": ""}])
+    definition = {"user": "Czym r\u00f3\u017cni si\u0119 wy\u0142\u0105czenie od choroby?", "assistant": "Wy\u0142\u0105czenie to\u2026", "flag": "positive"}
+    assert tools.propose([definition])[0]["accepted"] == 0
+    assert tools.propose([{**definition, "task": "generation"}])[0]["accepted"] == 1
+    label = {"user": "Kategoria: lumbago", "assistant": '{"label": "CHOROBA"}', "flag": "positive", "task": "classification"}
+    assert tools.propose([label])[0]["accepted"] == 1
+    wrong = {**label, "user": "Kategoria: alkohol", "assistant": '{"label": "LEK"}'}
+    assert "LEK" in tools.propose([wrong])[0]["rejected"][0]["reason"]
+
+
+def test_single_exchange_corpus_drops_followup():
+    tools = CorpusAgentTools(ROWS, max_exchanges=1)
+    answer = json.dumps({"entities": [], "summary": "s"}, ensure_ascii=False)
+    example = {"user": "Nowy fragment bez wy\u0142\u0105cze\u0144.", "assistant": answer, "flag": "negative",
+               "followup": {"user": "A NIP?", "assistant": answer}}
+    result, event = tools.propose([example])
+    assert result["accepted"] == 1 and event["examples"][0]["turns"] == []
+    assert "followup" in result["warnings"][0]["warning"]

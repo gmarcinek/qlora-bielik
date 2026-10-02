@@ -180,14 +180,15 @@ def train(config_path: Path) -> None:
     dataset = load_dataset("json", data_files=config["data"])
     formatted = dataset.map(lambda example: _format_conversation(example, tokenizer))
     max_length = training_config["max_length"]
+    # datasets>=4 returns a lazy Column here; tokenizers accept only str or list.
     token_ids = {
-        split: tokenizer(formatted[split]["text"], add_special_tokens=False)["input_ids"] for split in formatted
+        split: tokenizer(list(formatted[split]["text"]), add_special_tokens=False)["input_ids"] for split in formatted
     }
     validation: list[tuple[list[int], list[str]]] = []
     group_counts: dict[str, int] = {}
     if "validation" in formatted:
         flags = _read_flags(config.get("validation_meta"), len(formatted["validation"]))
-        for ids, messages, flag in zip(token_ids["validation"], formatted["validation"]["messages"], flags):
+        for ids, messages, flag in zip(token_ids["validation"], list(formatted["validation"]["messages"]), flags):
             groups = example_groups(messages, flag)
             validation.append((ids[:max_length], groups))
             for group in groups:
