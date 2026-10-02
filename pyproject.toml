@@ -28,6 +28,7 @@ bielik-lab = "bielik_lora.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 where = ["src"]

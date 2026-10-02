@@ -330,7 +330,7 @@ def generate_and_score_ollama(
                 "model": model_name,
                 "messages": messages[:last],
                 "stream": False,
-                "options": {"temperature": 0, "num_predict": max_new_tokens, "num_ctx": 8192},
+                "options": {"temperature": 0, "num_predict": max_new_tokens, "num_ctx": 32768},
             }
             example_started = time.time()
             http_request = request.Request(

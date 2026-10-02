@@ -3,7 +3,8 @@
     xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
-    <include file="001-initial-schema.xml" relativeToChangelogFile="true" />
-    <include file="002-corpus-settings.xml" relativeToChangelogFile="true" />
-    <include file="003-unassigned-split.xml" relativeToChangelogFile="true" />
+    <changeSet id="002-corpus-settings" author="bielik-lab">
+        <sql> ALTER TABLE corpora ADD COLUMN settings JSONB NOT NULL DEFAULT '{}'::jsonb; </sql>
+        <rollback> ALTER TABLE corpora DROP COLUMN IF EXISTS settings; </rollback>
+    </changeSet>
 </databaseChangeLog>

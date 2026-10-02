@@ -1,0 +1,13 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+markitdown[pdf,docx,pptx,xlsx,xls,outlook]>=0.1.2
+pymupdf>=1.24
+charset-normalizer>=3.3
+# Biblioteki dostępne dla skryptów agenta.
+pandas>=2.2
+openpyxl>=3.1
+pypdf>=5.0
+python-docx>=1.1
+regex>=2024.0
+rapidfuzz>=3.9
+PyYAML>=6.0

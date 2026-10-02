@@ -11,13 +11,19 @@ import {
   Bot,
   ChevronDown,
   ChevronUp,
+  Check,
   Database,
   Download,
   FilePlus2,
   FileUp,
+  FolderOpen,
+  Copy,
   GraduationCap,
   MessageSquareText,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pencil,
+  Paperclip,
   Play,
   Plus,
   RefreshCw,
@@ -42,8 +48,12 @@ import {
   api,
   Corpus,
   Example,
+  CorpusAnalysis,
+  CorpusAnalysisPart,
+  CorpusSettings,
+  ExampleIssue,
+  SplitRatio,
   ExampleFlag,
-  ExampleReview,
   BulkTransformResult,
   EvaluationSummary,
   EvaluationCheckpointResult,
@@ -52,6 +62,8 @@ import {
   ServingStatus,
   ExportsStatus,
   ExportQuantization,
+  AgentModel,
+  AgentSession,
   ImportedExample,
   Message,
   MessageRole,
@@ -63,9 +75,15 @@ import {
   TrainingRunSummary,
 } from "./api";
 import { PageTemplate } from "./components/PageTemplate";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { MediumPageTemplate } from "./components/MediumPageTemplate";
 
 type Split = "train" | "validation" | "test";
+// "unassigned" = parked outside training ("bez splitu"); not a split you train or evaluate on.
+type ExampleSplit = Split | "unassigned";
+const splitLabel = (split: string) =>
+  split === "unassigned" ? "bez splitu" : split;
 type Draft = Message & { id: string };
 type ImportTarget =
   | "messages"
@@ -314,6 +332,552 @@ function autoMapRecords(
   return examples.length ? { examples, skipped } : null;
 }
 
+type AgentRequest = { id: number; text: string };
+
+type AgentLogItem = {
+  kind: "user" | "assistant" | "tool" | "error";
+  text: string;
+};
+
+const SESSION_AREAS: Array<[string, string]> = [
+  ["uploads", "Załączniki (uploads)"],
+  ["work", "Robocze (work)"],
+  ["exports", "Wyniki (exports)"],
+  ["converted", "Po konwersji (converted)"],
+  ["notes", "Notatki (notes)"],
+  ["scripts", "Skrypty (scripts)"],
+];
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024)
+    return `${(bytes / 1024).toFixed(1).replace(".", ",")} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1).replace(".", ",")} MB`;
+}
+
+function prettyAnswer(answer: string) {
+  try {
+    return JSON.stringify(JSON.parse(answer), null, 2);
+  } catch {
+    return answer;
+  }
+}
+
+function toolLabel(name: string, args: Record<string, unknown>) {
+  const details = Object.entries(args)
+    .filter(([key]) => key !== "examples")
+    .map(([key, value]) => {
+      const text = JSON.stringify(value);
+      return `${key}=${text.length > 160 ? `${text.slice(0, 160)}…` : text}`;
+    })
+    .join(", ");
+  const count = Array.isArray(args.examples)
+    ? ` (${args.examples.length})`
+    : "";
+  return `${name}${count}${details ? ` · ${details}` : ""}`;
+}
+
+function EntityAgentPanel({
+  corpus,
+  onAdded,
+  request,
+}: {
+  corpus: Corpus | undefined;
+  onAdded: () => Promise<void>;
+  request?: AgentRequest | null;
+}) {
+  const storageKey = corpus ? `entity-agent:${corpus.id}` : "";
+  const [models, setModels] = useState<AgentModel[]>([]);
+  const [model, setModel] = useState(
+    () => localStorage.getItem("entity-agent-model") ?? "",
+  );
+  const [log, setLog] = useState<AgentLogItem[]>([]);
+  const [conversationId, setConversationId] = useState("");
+  const [session, setSession] = useState<AgentSession | null>(null);
+  const [filesOpen, setFilesOpen] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [uploading, setUploading] = useState(0);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+  const logRef = useRef<HTMLDivElement>(null);
+  const uploadRef = useRef<HTMLInputElement>(null);
+  const refreshFiles = (sessionId: string) =>
+    api
+      .agentSession(sessionId)
+      .then(setSession)
+      .catch(() => setSession(null));
+  useEffect(() => {
+    void api.agentModels().then((result) => {
+      setModels(result.models);
+      setModel((current) =>
+        result.models.some((item) => item.id === current && item.available)
+          ? current
+          : (result.default ?? ""),
+      );
+    });
+  }, []);
+  const corpusModel = corpus?.settings?.default_model;
+  useEffect(() => {
+    if (
+      corpusModel &&
+      models.some((item) => item.id === corpusModel && item.available)
+    )
+      setModel(corpusModel);
+  }, [corpus?.id, corpusModel, models]);
+  useEffect(() => {
+    if (!storageKey) return;
+    const saved = JSON.parse(localStorage.getItem(storageKey) ?? "{}");
+    const sessionId: string = saved.conversationId ?? crypto.randomUUID();
+    setLog(saved.log ?? []);
+    setConversationId(sessionId);
+    setSession(null);
+    void refreshFiles(sessionId);
+  }, [storageKey]);
+  useEffect(() => {
+    if (storageKey && conversationId)
+      localStorage.setItem(storageKey, JSON.stringify({ log, conversationId }));
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [storageKey, log, conversationId]);
+  useEffect(() => {
+    if (!request) return;
+    // While the agent is busy the request waits in the composer instead of being lost.
+    if (busy || !model) setInput(request.text);
+    else void send(request.text);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request?.id]);
+  const send = async (override?: string) => {
+    const text = (override ?? input).trim();
+    if (!corpus || !model || !text || busy) return;
+    const history = [...log, { kind: "user" as const, text }];
+    setLog(history);
+    if (override === undefined) setInput("");
+    setBusy(true);
+    setError("");
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      await api.agentChat(
+        corpus.id,
+        model,
+        history
+          .filter((item) => item.kind === "user" || item.kind === "assistant")
+          .map((item) => ({
+            role: item.kind as "user" | "assistant",
+            content: item.text,
+          })),
+        (event) => {
+          if (event.type === "text")
+            setLog((current) => [
+              ...current,
+              { kind: "assistant", text: event.content },
+            ]);
+          else if (event.type === "tool_call")
+            setLog((current) => [
+              ...current,
+              { kind: "tool", text: toolLabel(event.name, event.arguments) },
+            ]);
+          else if (event.type === "progress")
+            setLog((current) => [
+              ...current,
+              { kind: "tool", text: `… ${event.message}` },
+            ]);
+          else if (event.type === "tool_result" && !event.ok)
+            setLog((current) => [
+              ...current,
+              {
+                kind: "error",
+                text: `${event.name}: ${event.error ?? "błąd"}`,
+              },
+            ]);
+          else if (event.type === "proposals_changed") {
+            setLog((current) => [
+              ...current,
+              {
+                kind: "tool",
+                text: `${event.action === "update_proposals" ? "Poprawiono" : "Odrzucono"} propozycje: ${event.count}`,
+              },
+            ]);
+            void onAdded();
+          } else if (event.type === "examples_parked") {
+            setLog((current) => [
+              ...current,
+              {
+                kind: "tool",
+                text: `Przeniesiono do „bez splitu” (poza trening): ${event.count}`,
+              },
+            ]);
+            void onAdded();
+          } else if (event.type === "proposals") {
+            setLog((current) => [
+              ...current,
+              {
+                kind: "tool",
+                text: `Zapisano w zakładce Propozycje: ${event.saved} (partia ${event.batch})`,
+              },
+            ]);
+            void onAdded();
+          } else if (event.type === "error")
+            setLog((current) => [
+              ...current,
+              { kind: "error", text: event.message },
+            ]);
+        },
+        controller.signal,
+        conversationId,
+      );
+    } catch (requestError) {
+      if (!controller.signal.aborted)
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : String(requestError),
+        );
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+      void refreshFiles(conversationId);
+    }
+  };
+  const uploadFiles = async (files: FileList | File[] | null) => {
+    const list = files ? Array.from(files) : [];
+    if (!list.length || !conversationId) return;
+    setUploading((count) => count + list.length);
+    setError("");
+    try {
+      for (const file of list) {
+        try {
+          const attachment = await api.uploadAgentFile(conversationId, file);
+          const placeholder = `--- załącznik ${attachment.id}: ${attachment.name}, ${formatBytes(attachment.bytes)} ---`;
+          setInput((current) =>
+            current.trim()
+              ? `${current.trimEnd()}\n${placeholder}`
+              : placeholder,
+          );
+          setLog((current) => [
+            ...current,
+            {
+              kind: "tool",
+              text: `Załącznik ${attachment.id} → ${attachment.path} (${
+                attachment.handling === "markitdown"
+                  ? attachment.converted
+                    ? `MarkItDown: ${attachment.converted}, ${attachment.lines} linii`
+                    : `konwersja nieudana: ${attachment.error}`
+                  : attachment.handling === "text"
+                    ? `tekst, ${attachment.lines} linii`
+                    : "plik binarny"
+              })`,
+            },
+          ]);
+        } finally {
+          setUploading((count) => count - 1);
+        }
+      }
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : String(requestError),
+      );
+    } finally {
+      if (uploadRef.current) uploadRef.current.value = "";
+      void refreshFiles(conversationId);
+    }
+  };
+  const sessionFiles = session?.files ?? [];
+  const visibleFiles = sessionFiles.filter(
+    (file) =>
+      file.path.includes("/") &&
+      !file.path.endsWith(".md.json") &&
+      file.path !== "notes/notes.jsonl",
+  );
+  const attachmentsByPath = new Map(
+    (session?.attachments ?? []).map((item) => [item.path, item]),
+  );
+  const copyTranscript = () =>
+    void navigator.clipboard.writeText(
+      log
+        .filter((item) => item.kind === "user" || item.kind === "assistant")
+        .map(
+          (item) =>
+            `${item.kind === "user" ? "user" : "asystent"}:\n${item.text}`,
+        )
+        .join("\n\n"),
+    );
+  return (
+    <aside
+      className={`entity-agent${dragging ? " dragging" : ""}`}
+      onDragOver={(event) => {
+        if (!corpus || !event.dataTransfer.types.includes("Files")) return;
+        event.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null))
+          setDragging(false);
+      }}
+      onDrop={(event) => {
+        if (!event.dataTransfer.files.length) return;
+        event.preventDefault();
+        setDragging(false);
+        void uploadFiles(event.dataTransfer.files);
+      }}
+    >
+      {dragging && (
+        <div className="entity-agent-dropzone">
+          Upuść pliki — dołączę je do wiadomości
+        </div>
+      )}
+      <div className="entity-agent-header">
+        <div className="d-flex justify-content-between align-items-center gap-2">
+          <h2 className="h6 mb-0">
+            <Sparkles size={16} className="me-1" />
+            Asystent
+          </h2>
+          <div className="d-flex gap-1">
+            <button
+              className={`btn btn-sm ${filesOpen ? "btn-secondary" : "btn-outline-secondary"}`}
+              type="button"
+              title="Pliki rozmowy"
+              disabled={!corpus}
+              onClick={() => {
+                setFilesOpen((open) => !open);
+                if (conversationId) void refreshFiles(conversationId);
+              }}
+            >
+              <FolderOpen size={16} />
+              {visibleFiles.length > 0 && (
+                <span className="ms-1">{visibleFiles.length}</span>
+              )}
+            </button>
+            <button
+              className="btn btn-sm btn-outline-secondary"
+              type="button"
+              title="Kopiuj rozmowę (user/asystent)"
+              disabled={!log.length}
+              onClick={copyTranscript}
+            >
+              <Copy size={16} />
+            </button>
+            <button
+              className="btn btn-sm btn-outline-secondary"
+              type="button"
+              disabled={busy || (!log.length && !visibleFiles.length)}
+              onClick={() => {
+                if (conversationId)
+                  void api.closeAgentSession(conversationId).catch(() => null);
+                setLog([]);
+                setSession(null);
+                setConversationId(crypto.randomUUID());
+              }}
+            >
+              Nowa rozmowa
+            </button>
+          </div>
+        </div>
+        <select
+          className="form-select form-select-sm mt-2"
+          value={model}
+          onChange={(event) => {
+            setModel(event.target.value);
+            localStorage.setItem("entity-agent-model", event.target.value);
+          }}
+          aria-label="Model agenta"
+        >
+          {models.map((item) => (
+            <option key={item.id} value={item.id} disabled={!item.available}>
+              {item.label}
+              {item.available ? "" : " (brak klucza API)"}
+            </option>
+          ))}
+        </select>
+      </div>
+      {filesOpen && (
+        <div className="entity-agent-filesystem">
+          <div className="d-flex justify-content-between align-items-center mb-2">
+            <strong className="small">
+              Pliki rozmowy · {conversationId.slice(0, 8)}
+            </strong>
+            <div className="d-flex gap-1">
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                type="button"
+                title="Odśwież"
+                onClick={() => void refreshFiles(conversationId)}
+              >
+                <RefreshCw size={14} />
+              </button>
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                type="button"
+                title="Zamknij"
+                onClick={() => setFilesOpen(false)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+          {SESSION_AREAS.map(([area, label]) => {
+            const files = visibleFiles.filter((file) =>
+              file.path.startsWith(`${area}/`),
+            );
+            return (
+              <section key={area} className="mb-3">
+                <div className="small text-secondary mb-1">
+                  {label} · {files.length}
+                </div>
+                {files.length ? (
+                  <ul className="list-unstyled small mb-0">
+                    {files.map((file) => {
+                      const attachment = attachmentsByPath.get(file.path);
+                      return (
+                        <li key={file.path} className="entity-agent-file">
+                          {attachment && (
+                            <span className="badge text-bg-light border text-dark me-1">
+                              {attachment.id}
+                            </span>
+                          )}
+                          <a
+                            href={`/api/agent/sessions/${conversationId}/files?path=${encodeURIComponent(file.path)}`}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {file.path.slice(area.length + 1)}
+                          </a>{" "}
+                          <span className="text-secondary">
+                            {formatBytes(file.bytes)}
+                            {attachment ? ` · ${attachment.handling}` : ""}
+                          </span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : (
+                  <div className="small text-secondary">—</div>
+                )}
+              </section>
+            );
+          })}
+          <button
+            className="btn btn-sm btn-outline-primary"
+            type="button"
+            disabled={!corpus || !conversationId}
+            onClick={() => uploadRef.current?.click()}
+          >
+            <Paperclip size={14} className="me-1" /> Dodaj pliki
+          </button>
+        </div>
+      )}
+      <div className="entity-agent-log" ref={logRef}>
+        {!corpus && (
+          <p className="text-secondary small">
+            Wybierz korpus po lewej, aby rozpocząć rozmowę.
+          </p>
+        )}
+        {corpus && !log.length && (
+          <p className="text-secondary small">
+            Asystent ogólnego przeznaczenia: rozmawia na dowolny temat, może
+            przeglądać korpus „{corpus.name}”, czytać dołączone pliki i
+            proponować nowe przykłady w formacie korpusu (trafiają do zakładki
+            Propozycje do Twojej oceny, poza trening). Pliki przeciągnij do okna
+            czatu.
+          </p>
+        )}
+        {log.map((item, index) =>
+          item.kind === "tool" ? (
+            <div className="entity-agent-tool" key={index}>
+              → {item.text}
+            </div>
+          ) : item.kind === "error" ? (
+            <div className="text-danger small" key={index}>
+              {item.text}
+            </div>
+          ) : (
+            <article className={`chat-message ${item.kind}`} key={index}>
+              <strong>{item.kind === "user" ? "Ty" : "Asystent"}</strong>
+              <MessageContent
+                content={item.text}
+                markdown={item.kind === "assistant"}
+              />
+            </article>
+          ),
+        )}
+        {busy && <div className="entity-agent-tool">Asystent pracuje…</div>}
+        {uploading > 0 && (
+          <div className="entity-agent-tool">
+            Wgrywanie i konwersja załączników: {uploading}…
+          </div>
+        )}
+        <form
+          className="entity-agent-input"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void send();
+          }}
+        >
+          {error && <p className="text-danger small mb-2">{error}</p>}
+          <div className="agent-composer">
+            <textarea
+              className="form-control"
+              rows={5}
+              value={input}
+              disabled={!corpus}
+              placeholder="Napisz wiadomość albo przeciągnij pliki. Enter wysyła, Shift+Enter nowa linia"
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <input
+              ref={uploadRef}
+              type="file"
+              multiple
+              hidden
+              onChange={(event) => void uploadFiles(event.target.files)}
+            />
+            <button
+              className="btn btn-sm btn-link agent-composer-attach"
+              type="button"
+              title="Dołącz pliki (możesz też przeciągnąć je do okna czatu)"
+              aria-label="Dołącz pliki"
+              disabled={!corpus || !conversationId}
+              onClick={() => uploadRef.current?.click()}
+            >
+              <Paperclip size={16} />
+            </button>
+            <div className="agent-composer-actions">
+              {busy && (
+                <button
+                  className="btn btn-sm btn-outline-danger"
+                  type="button"
+                  title="Przerwij"
+                  aria-label="Przerwij"
+                  onClick={() => abortRef.current?.abort()}
+                >
+                  <Square size={14} />
+                </button>
+              )}
+              <button
+                className="btn btn-sm btn-primary"
+                type="submit"
+                disabled={
+                  busy || uploading > 0 || !corpus || !model || !input.trim()
+                }
+              >
+                <Send size={14} className="me-1" /> Wyślij
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </aside>
+  );
+}
+
 type TransformName = "wrap_entities_summary" | "pretty_json" | "compact_json";
 
 const TRANSFORM_LABELS: Record<
@@ -339,9 +903,57 @@ const TRANSFORM_LABELS: Record<
 
 const JSON_TOKEN =
   /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
+const CLAIM_MARKER = /\[((?:R\d+\.)?[FIS]\d*)\]/g;
+const CLAIM_MARKER_ONLY = /^\[((?:R\d+\.)?([FIS])\d*)\]$/;
 
-function MessageContent({ content }: { content: string }) {
-  if (!/^\s*[{[]/.test(content)) return <p>{content}</p>;
+function MarkdownContent({ content }: { content: string }) {
+  // Turn [F3] / [R1.I2] markers into inline code outside fenced blocks so they can be rendered as badges.
+  const marked = content
+    .split(/(```[\s\S]*?```)/g)
+    .map((part, index) =>
+      index % 2 ? part : part.replace(CLAIM_MARKER, "`[$1]`"),
+    )
+    .join("");
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          code: ({ className, children }) => {
+            const marker = CLAIM_MARKER_ONLY.exec(String(children));
+            if (marker && !className)
+              return (
+                <span
+                  className={`claim-marker ${marker[2] === "F" ? "fact" : "interpretation"}`}
+                  title={marker[2] === "F" ? "Fakt ze źródła" : "Interpretacja"}
+                >
+                  {marker[1]}
+                </span>
+              );
+            return <code className={className}>{children}</code>;
+          },
+          a: ({ href, children }) => (
+            <a href={href} target="_blank" rel="noreferrer">
+              {children}
+            </a>
+          ),
+        }}
+      >
+        {marked}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function MessageContent({
+  content,
+  markdown = false,
+}: {
+  content: string;
+  markdown?: boolean;
+}) {
+  if (!/^\s*[{[]/.test(content))
+    return markdown ? <MarkdownContent content={content} /> : <p>{content}</p>;
   const parts: ReactNode[] = [];
   let last = 0;
   for (const match of content.matchAll(JSON_TOKEN)) {
@@ -369,6 +981,448 @@ function MessageContent({ content }: { content: string }) {
   return <p className="json-content">{parts}</p>;
 }
 
+type CorpusView = "list" | "proposals" | "analysis" | "duplicates" | "settings";
+
+const DEFAULT_SPLIT_RATIO: SplitRatio = { train: 80, validation: 10, test: 10 };
+
+function CorpusSettingsView({
+  corpusId,
+  onSaved,
+}: {
+  corpusId: string;
+  onSaved: () => void;
+}) {
+  const [settings, setSettings] = useState<CorpusSettings | null>(null);
+  const [models, setModels] = useState<AgentModel[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(
+    null,
+  );
+  useEffect(() => {
+    setSettings(null);
+    setMessage(null);
+    void api.corpusSettings(corpusId).then(setSettings);
+    void api.agentModels().then((result) => setModels(result.models));
+  }, [corpusId]);
+  if (!settings) return <div className="text-secondary">Wczytywanie…</div>;
+  const ratio = settings.split_ratio ?? DEFAULT_SPLIT_RATIO;
+  const ratioSum = ratio.train + ratio.validation + ratio.test;
+  const setRatio = (split: keyof SplitRatio, value: number) =>
+    setSettings({
+      ...settings,
+      split_ratio: { ...ratio, [split]: Math.min(100, Math.max(0, value)) },
+    });
+  async function save() {
+    if (!settings) return;
+    setSaving(true);
+    setMessage(null);
+    try {
+      setSettings(await api.updateCorpusSettings(corpusId, settings));
+      setMessage({ ok: true, text: "Zapisano ustawienia korpusu." });
+      onSaved();
+    } catch (error) {
+      setMessage({
+        ok: false,
+        text: error instanceof Error ? error.message : "Nie udało się zapisać.",
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <section className="corpus-settings">
+      <div className="mb-4">
+        <label className="form-label fw-semibold" htmlFor="corpus-agent-prompt">
+          Dodatkowy prompt systemowy korpusu
+        </label>
+        <p className="small text-secondary mb-2">
+          Opisz, do czego służy ten korpus i na co asystent ma zwracać uwagę —
+          tekst trafia do instrukcji asystenta przy każdej rozmowie w tym
+          korpusie.
+        </p>
+        <textarea
+          id="corpus-agent-prompt"
+          className="form-control"
+          rows={8}
+          maxLength={20000}
+          value={settings.agent_prompt}
+          placeholder="Np. Korpus uczy Bielika ekstrakcji wyłączeń odpowiedzialności z OWU. Wiadomość użytkownika zawsze zawiera tytuł artykułu i zdanie wprowadzające…"
+          onChange={(event) =>
+            setSettings({ ...settings, agent_prompt: event.target.value })
+          }
+        />
+      </div>
+      <div className="mb-4">
+        <label className="form-label fw-semibold" htmlFor="corpus-model">
+          Domyślny model asystenta
+        </label>
+        <select
+          id="corpus-model"
+          className="form-select corpus-settings-model"
+          value={settings.default_model ?? ""}
+          onChange={(event) =>
+            setSettings({
+              ...settings,
+              default_model: event.target.value || null,
+            })
+          }
+        >
+          <option value="">— jak w panelu asystenta —</option>
+          {models.map((item) => (
+            <option key={item.id} value={item.id} disabled={!item.available}>
+              {item.label}
+              {item.available ? "" : " (brak klucza API)"}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="mb-4">
+        <span className="form-label fw-semibold d-block">
+          Docelowe proporcje splitów
+        </span>
+        <p className="small text-secondary mb-2">
+          Asystent przypisuje split nowym propozycjom tak, by zbliżać korpus do
+          tych proporcji; zakładka Analiza pokazuje odchylenie.
+        </p>
+        <div className="d-flex flex-wrap gap-2 align-items-center">
+          {(Object.keys(DEFAULT_SPLIT_RATIO) as Array<keyof SplitRatio>).map(
+            (split) => (
+              <div
+                className="input-group input-group-sm split-ratio-input"
+                key={split}
+              >
+                <span className="input-group-text">{split}</span>
+                <input
+                  className="form-control"
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={ratio[split]}
+                  onChange={(event) =>
+                    setRatio(split, Number(event.target.value) || 0)
+                  }
+                  aria-label={`Udział ${split}`}
+                />
+                <span className="input-group-text">%</span>
+              </div>
+            ),
+          )}
+          <span
+            className={`small ${ratioSum === 100 ? "text-secondary" : "text-danger"}`}
+          >
+            Suma: {ratioSum}%
+          </span>
+        </div>
+      </div>
+      {message && (
+        <div
+          className={`alert py-2 ${message.ok ? "alert-success" : "alert-danger"}`}
+        >
+          {message.text}
+        </div>
+      )}
+      <button
+        className="btn btn-primary"
+        type="button"
+        disabled={saving || ratioSum !== 100}
+        onClick={() => void save()}
+      >
+        Zapisz ustawienia
+      </button>
+    </section>
+  );
+}
+
+function BalanceBar({
+  positive,
+  negative,
+  unclassified,
+}: {
+  positive: number;
+  negative: number;
+  unclassified: number;
+}) {
+  const total = positive + negative + unclassified || 1;
+  return (
+    <div
+      className="balance-bar"
+      title={`pozytywne ${positive} · negatywne ${negative} · do klasyfikacji ${unclassified}`}
+    >
+      <span
+        className="positive"
+        style={{ width: `${(positive / total) * 100}%` }}
+      />
+      <span
+        className="negative"
+        style={{ width: `${(negative / total) * 100}%` }}
+      />
+      <span
+        className="unclassified"
+        style={{ width: `${(unclassified / total) * 100}%` }}
+      />
+    </div>
+  );
+}
+
+function CorpusAnalysisView({
+  analysis,
+  loading,
+  onRefresh,
+  onOpenExample,
+}: {
+  analysis: CorpusAnalysis | null;
+  loading: boolean;
+  onRefresh: () => void;
+  onOpenExample: (exampleId: string) => void;
+}) {
+  const [scope, setScope] = useState<"corpus" | "proposals">("corpus");
+  if (!analysis)
+    return (
+      <div className="text-secondary">
+        {loading ? "Analizuję korpus…" : "Brak analizy."}
+      </div>
+    );
+  const { proposals } = analysis;
+  const corpus = scope === "proposals" ? proposals : analysis.corpus;
+  const pendingByType = new Map(
+    scope === "corpus" ? proposals.types.map((row) => [row.type, row]) : [],
+  );
+  const issues = Object.entries(corpus.issues).filter(([, item]) => item.count);
+  const lengths = corpus.length_tokens;
+  const summary = (part: CorpusAnalysisPart) =>
+    `${part.examples} · poz. ${part.flags.positive} · neg. ${part.flags.negative} · do klas. ${part.flags.unclassified}`;
+  return (
+    <section className="corpus-analysis">
+      <div
+        className="btn-group btn-group-sm mb-2"
+        role="group"
+        aria-label="Zakres analizy"
+      >
+        <button
+          className={`btn ${scope === "corpus" ? "btn-primary" : "btn-outline-primary"}`}
+          type="button"
+          onClick={() => setScope("corpus")}
+        >
+          Korpus ({analysis.corpus.examples})
+        </button>
+        <button
+          className={`btn ${scope === "proposals" ? "btn-primary" : "btn-outline-primary"}`}
+          type="button"
+          disabled={!proposals.examples}
+          onClick={() => setScope("proposals")}
+        >
+          Propozycje ({proposals.examples})
+        </button>
+        <span
+          className="btn btn-outline-secondary disabled"
+          title="Przykłady przeniesione poza trening; pokaż je w Liście filtrem „bez splitu”"
+        >
+          Bez splitu ({analysis.unassigned ?? 0})
+        </span>
+      </div>
+      <div className="d-flex flex-wrap align-items-center gap-2 mb-3">
+        <span className="badge text-bg-secondary">
+          Korpus: {summary(analysis.corpus)}
+        </span>
+        {proposals.examples > 0 && (
+          <span className="badge text-bg-primary">
+            Propozycje: {summary(proposals)}
+          </span>
+        )}
+        <span className="badge text-bg-light border text-dark">
+          system prompt: {corpus.system_prompt.with} z /{" "}
+          {corpus.system_prompt.without} bez
+        </span>
+        <span className="badge text-bg-light border text-dark">
+          wymiany:{" "}
+          {Object.entries(corpus.exchanges)
+            .map(([count, number]) => `${count}× ${number}`)
+            .join(", ")}
+        </span>
+        <span
+          className={`badge border ${lengths.max_length && lengths.max > lengths.max_length ? "text-bg-warning" : "text-bg-light text-dark"}`}
+          title={`Szacunek: ${lengths.estimate_chars_per_token} znaku na token`}
+        >
+          tokeny ~ mediana {lengths.median} · p95 {lengths.p95} · max{" "}
+          {lengths.max}
+          {lengths.max_length ? ` / limit ${lengths.max_length}` : ""}
+        </span>
+        <button
+          className="btn btn-sm btn-outline-secondary ms-auto"
+          type="button"
+          disabled={loading}
+          onClick={onRefresh}
+        >
+          <RefreshCw size={14} className="me-1" /> Odśwież
+        </button>
+      </div>
+      <h2 className="h6">Jakość przykładów</h2>
+      <div className="mb-3">
+        {issues.length ? (
+          issues.map(([check, item]) => (
+            <details className="analysis-issue mb-2" key={check}>
+              <summary>
+                <span className="badge text-bg-danger me-2">{item.count}</span>
+                {item.label}
+              </summary>
+              <ul className="list-unstyled small mt-2 mb-0">
+                {item.examples.map((entry, index) => (
+                  <li key={`${entry.id}-${index}`}>
+                    <code
+                      className="user-select-all me-1"
+                      title="Kliknij, aby zaznaczyć całe id"
+                    >
+                      {entry.id}
+                    </code>
+                    <button
+                      className="btn btn-link btn-sm p-0 me-2"
+                      type="button"
+                      onClick={() => onOpenExample(entry.id)}
+                    >
+                      otwórz
+                    </button>
+                    <span className="text-secondary">{entry.detail}</span>
+                  </li>
+                ))}
+                {item.count > item.examples.length && (
+                  <li className="text-secondary">
+                    … i {item.count - item.examples.length} kolejnych
+                  </li>
+                )}
+              </ul>
+            </details>
+          ))
+        ) : (
+          <div className="text-secondary small">Brak wykrytych problemów.</div>
+        )}
+      </div>
+      <h2 className="h6 mt-3">Split × flaga</h2>
+      <div className="table-responsive mb-3">
+        <table className="table table-sm align-middle analysis-table">
+          <thead>
+            <tr>
+              <th>Split</th>
+              <th>Pozytywne</th>
+              <th>Negatywne</th>
+              <th>Do klasyfikacji</th>
+              <th>Balans</th>
+              <th>Udział / cel</th>
+            </tr>
+          </thead>
+          <tbody>
+            {Object.entries(corpus.splits).map(([split, counts]) => {
+              const share = corpus.examples
+                ? Math.round(
+                    ((counts.positive + counts.negative + counts.unclassified) /
+                      corpus.examples) *
+                      100,
+                  )
+                : 0;
+              const target = analysis.split_target?.[split as keyof SplitRatio];
+              return (
+                <tr key={split}>
+                  <td>{split}</td>
+                  <td>{counts.positive}</td>
+                  <td>{counts.negative}</td>
+                  <td>{counts.unclassified}</td>
+                  <td>
+                    <BalanceBar {...counts} />
+                  </td>
+                  <td
+                    className={
+                      target !== undefined && Math.abs(share - target) > 5
+                        ? "text-danger"
+                        : ""
+                    }
+                  >
+                    {share}%{target !== undefined ? ` / ${target}%` : ""}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <h2 className="h6">Typy encji</h2>
+      <p className="small text-secondary mb-2">
+        Pozytywny liczy się do typów z odpowiedzi, negatywny — do typu, o który
+        pytało polecenie. Kolumna „propozycje” to oczekujące propozycje
+        asystenta (poz./neg.).
+      </p>
+      <div className="table-responsive mb-3">
+        <table className="table table-sm align-middle analysis-table">
+          <thead>
+            <tr>
+              <th>Typ</th>
+              <th>Razem</th>
+              <th>Poz.</th>
+              <th>Neg.</th>
+              <th>Udział neg.</th>
+              <th>Balans</th>
+              <th>train / val / test</th>
+              <th>Propozycje</th>
+              <th>Ostrzeżenia</th>
+            </tr>
+          </thead>
+          <tbody>
+            {corpus.types.map((row) => {
+              const pending = pendingByType.get(row.type);
+              return (
+                <tr key={row.type}>
+                  <td>
+                    <code>{row.type}</code>
+                  </td>
+                  <td>{row.total}</td>
+                  <td>{row.positive}</td>
+                  <td>{row.negative}</td>
+                  <td>
+                    {row.negative_share === null
+                      ? "—"
+                      : `${Math.round(row.negative_share * 100)}%`}
+                  </td>
+                  <td>
+                    <BalanceBar {...row} />
+                  </td>
+                  <td>
+                    {row.train} / {row.validation} / {row.test}
+                  </td>
+                  <td>
+                    {pending
+                      ? `+${pending.positive} / +${pending.negative}`
+                      : "—"}
+                  </td>
+                  <td>
+                    {row.warnings.map((warning) => (
+                      <span
+                        className="badge text-bg-warning me-1 mb-1"
+                        key={warning}
+                      >
+                        {warning}
+                      </span>
+                    ))}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {corpus.warnings.length > 0 && (
+        <div className="alert alert-warning py-2">
+          <strong className="small d-block mb-1">
+            Zbalansowanie — do uzupełnienia
+          </strong>
+          <ul className="small mb-0">
+            {corpus.warnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function CorporaPage({
   corpora,
   onCreated,
@@ -385,6 +1439,26 @@ function CorporaPage({
   const navigate = useNavigate();
   const { corpusId } = useParams();
   const selectedCorpus = corpora.find((corpus) => corpus.id === corpusId);
+  const loadExamples = () =>
+    corpusId ? api.examples(corpusId) : Promise.resolve<Example[]>([]);
+  useEffect(() => {
+    if (!corpusId && !openCreate && corpora.length)
+      navigate(`/corpora/${corpora[0].id}`, { replace: true });
+  }, [corpusId, openCreate, corpora, navigate]);
+  const splitRef = useRef<HTMLDivElement>(null);
+  const [agentWidth, setAgentWidth] = useState<number | null>(
+    () => Number(localStorage.getItem("corpora-agent-width")) || null,
+  );
+  const resizeAgent = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const bounds = splitRef.current?.getBoundingClientRect();
+    if (!bounds || !event.currentTarget.hasPointerCapture(event.pointerId))
+      return;
+    const width = Math.round(
+      Math.min(Math.max(bounds.right - event.clientX, 320), bounds.width - 480),
+    );
+    setAgentWidth(width);
+    localStorage.setItem("corpora-agent-width", String(width));
+  };
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [open, setOpen] = useState(false);
@@ -393,26 +1467,104 @@ function CorporaPage({
   const [examples, setExamples] = useState<Example[]>([]);
   const [examplesLoading, setExamplesLoading] = useState(false);
   const [selectedExample, setSelectedExample] = useState<Example | null>(null);
+  const [exampleIssues, setExampleIssues] = useState<ExampleIssue[]>([]);
+  const [agentRequest, setAgentRequest] = useState<AgentRequest | null>(null);
+  const [fixNote, setFixNote] = useState("");
+  useEffect(() => setFixNote(""), [selectedExample?.id]);
+  function requestFix() {
+    if (!selectedExample) return;
+    const proposal = selectedExample.metadata.flag === "proposal";
+    const text = [
+      `Napraw, jeśli to możliwe, ${proposal ? "propozycję" : "przykład korpusu"} id ${selectedExample.id} (split ${selectedExample.split}).`,
+      "Problemy z analizy:",
+      ...exampleIssues.map(
+        (issue) =>
+          `- ${issue.label}${issue.detail ? ` — ${issue.detail}` : ""}`,
+      ),
+      ...(fixNote.trim()
+        ? ["Wskazówki użytkownika, jak zmienić:", fixNote.trim()]
+        : []),
+      proposal
+        ? "Popraw ją przez update_proposals."
+        : `Nie edytuj korpusu bezpośrednio — wywołaj propose_examples z replaces: "${selectedExample.id}" (poprawiona wersja zastąpi oryginał po akceptacji, bez duplikatu).`,
+      "Jeśli naprawa nie jest możliwa bez zgadywania treści, wyjaśnij dlaczego.",
+      "",
+      "Przykład:",
+      "```json",
+      JSON.stringify(selectedExample.messages, null, 2),
+      "```",
+    ].join("\n");
+    setAgentRequest({ id: Date.now(), text });
+    closeDrawer();
+  }
   const [drawerMessages, setDrawerMessages] = useState<Message[]>([]);
+  useEffect(() => setExampleIssues([]), [selectedExample?.id]);
+  useEffect(() => {
+    if (!selectedExample || !drawerMessages.length) return;
+    let current = true;
+    const timer = window.setTimeout(() => {
+      void api
+        .exampleIssues(selectedExample.id, drawerMessages)
+        .then((issues) => current && setExampleIssues(issues))
+        .catch(() => undefined);
+    }, 400);
+    return () => {
+      current = false;
+      window.clearTimeout(timer);
+    };
+  }, [selectedExample, drawerMessages]);
   const [drawerEditing, setDrawerEditing] = useState(false);
   const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(
     null,
   );
+  useEffect(() => {
+    if (editingMessageIndex === null) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (
+        !(event.target as HTMLElement | null)?.closest(".chat-message.editing")
+      )
+        setEditingMessageIndex(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [editingMessageIndex]);
   const [drawerError, setDrawerError] = useState("");
-  const [review, setReview] = useState<ExampleReview | null>(null);
-  const [reviewing, setReviewing] = useState(false);
   const [classification, setClassification] =
     useState<ClassificationStatus | null>(null);
   const [query, setQuery] = useState("");
-  const [splitFilter, setSplitFilter] = useState<Split | "">("");
+  const [splitFilter, setSplitFilter] = useState<ExampleSplit | "">("");
   const [flagFilter, setFlagFilter] = useState<ExampleFlag | "">("");
   const [importFilter, setImportFilter] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [bulkSplit, setBulkSplit] = useState<Split>("train");
+  const [bulkSplit, setBulkSplit] = useState<ExampleSplit>("train");
   const [validationPercent, setValidationPercent] = useState(10);
-  const [exportSplit, setExportSplit] = useState<Split>("train");
+  const corpusValidation = selectedCorpus?.settings?.split_ratio?.validation;
+  useEffect(() => {
+    if (corpusValidation) setValidationPercent(corpusValidation);
+  }, [corpusId, corpusValidation]);
+  const [exportSplit, setExportSplit] = useState<ExampleSplit | "all">("all");
   const [importSplit, setImportSplit] = useState<Split>("train");
-  const [activeView, setActiveView] = useState<"list" | "duplicates">("list");
+  const [activeView, setActiveView] = useState<CorpusView>("analysis");
+  const [analysis, setAnalysis] = useState<CorpusAnalysis | null>(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const loadAnalysis = () => {
+    if (!corpusId) return;
+    setAnalysisLoading(true);
+    api
+      .corpusAnalysis(corpusId)
+      .then(setAnalysis)
+      .catch((error) =>
+        setImportError(
+          error instanceof Error ? error.message : "Analiza nie powiodła się.",
+        ),
+      )
+      .finally(() => setAnalysisLoading(false));
+  };
+  useEffect(() => {
+    setAnalysis(null);
+    if (activeView === "analysis") loadAnalysis();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, corpusId]);
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [importNotice, setImportNotice] = useState("");
@@ -426,9 +1578,7 @@ function CorporaPage({
     setImportError("");
     try {
       const result = await api.restoreTrash(lastDeletion.trashId);
-      setExamples(
-        await (corpusId ? api.examples(corpusId) : api.allExamples()),
-      );
+      setExamples(await loadExamples());
       setLastDeletion(null);
       setImportNotice(`Przywrócono encje: ${result.restored}.`);
       onCorpusUpdated();
@@ -453,8 +1603,7 @@ function CorporaPage({
     revisionId: string;
     count: number;
   } | null>(null);
-  const reloadExamples = async () =>
-    setExamples(await (corpusId ? api.examples(corpusId) : api.allExamples()));
+  const reloadExamples = async () => setExamples(await loadExamples());
   async function previewTransform(
     name: TransformName = transformName,
     exampleIds: string[] = [...selectedIds],
@@ -568,7 +1717,7 @@ function CorporaPage({
   useEffect(() => {
     setExamplesLoading(true);
     setSelectedExample(null);
-    const request = corpusId ? api.examples(corpusId) : api.allExamples();
+    const request = loadExamples();
     request
       .then((items) => {
         setExamples(items);
@@ -587,7 +1736,7 @@ function CorporaPage({
       void api.classificationStatus().then((job) => {
         setClassification(job);
         if (job.state !== "running") {
-          const request = corpusId ? api.examples(corpusId) : api.allExamples();
+          const request = loadExamples();
           void request.then(setExamples);
         }
       });
@@ -907,14 +2056,12 @@ function CorporaPage({
     setDrawerEditing(false);
     setEditingMessageIndex(null);
     setDrawerError("");
-    setReview(null);
   }
   function closeDrawer() {
     setSelectedExample(null);
     setDrawerEditing(false);
     setEditingMessageIndex(null);
     setDrawerError("");
-    setReview(null);
   }
   function updateDrawerMessage(index: number, change: Partial<Message>) {
     setDrawerMessages((current) =>
@@ -983,7 +2130,7 @@ function CorporaPage({
         ...selectedExample,
         ...updated,
         corpus_name: selectedExample.corpus_name,
-        metadata: { flag: payload.flag },
+        metadata: { ...selectedExample.metadata, flag: payload.flag },
       };
       setExamples((current) =>
         asCopy
@@ -1004,23 +2151,7 @@ function CorporaPage({
       setBusy(false);
     }
   }
-  async function reviewSelectedExample() {
-    if (!selectedExample) return;
-    setReviewing(true);
-    setDrawerError("");
-    try {
-      setReview(await api.reviewExample(selectedExample.id));
-    } catch (error) {
-      setDrawerError(
-        error instanceof Error
-          ? error.message
-          : "Nie udało się sprawdzić encji.",
-      );
-    } finally {
-      setReviewing(false);
-    }
-  }
-  async function applyReviewFlag(flag: ExampleFlag) {
+  async function applyFlag(flag: ExampleFlag) {
     if (!selectedExample) return;
     setBusy(true);
     setDrawerError("");
@@ -1035,7 +2166,6 @@ function CorporaPage({
         current.map((example) => (example.id === merged.id ? merged : example)),
       );
       setSelectedExample(merged);
-      setReview(null);
     } catch (error) {
       setDrawerError(
         error instanceof Error
@@ -1185,7 +2315,13 @@ function CorporaPage({
         .filter((value): value is string => Boolean(value)),
     ),
   ];
-  const filteredExamples = examples.filter((example) => {
+  const corpusExamples = examples.filter(
+    (example) => example.metadata.flag !== "proposal",
+  );
+  const proposals = examples.filter(
+    (example) => example.metadata.flag === "proposal",
+  );
+  const filteredExamples = corpusExamples.filter((example) => {
     const createdAt = new Date(example.created_at);
     const from = fromDate ? new Date(`${fromDate}T00:00:00`) : null;
     const to = toDate ? new Date(`${toDate}T23:59:59.999`) : null;
@@ -1212,13 +2348,39 @@ function CorporaPage({
     (example) => example.metadata.flag === "unclassified",
   );
   function stepDrawer(offset: number) {
-    if (!selectedExample || drawerEditing || filteredExamples.length < 2)
-      return;
-    const index = filteredExamples.findIndex(
+    const list = activeView === "proposals" ? proposals : filteredExamples;
+    if (!selectedExample || drawerEditing || list.length < 2) return;
+    const index = list.findIndex(
       (example) => example.id === selectedExample.id,
     );
-    const count = filteredExamples.length;
-    openDrawer(filteredExamples[(index + offset + count) % count]);
+    const count = list.length;
+    openDrawer(list[(index + offset + count) % count]);
+  }
+  async function acceptProposals(exampleIds: string[]) {
+    if (!exampleIds.length) return;
+    setBusy(true);
+    setImportError("");
+    try {
+      const result = await api.acceptProposals(exampleIds);
+      await reloadExamples();
+      setSelectedIds(new Set());
+      setImportNotice(
+        `Zaakceptowano propozycje: ${result.accepted}.${result.replaced ? ` Zastąpione oryginały przeniesione do kosza: ${result.replaced}.` : ""}`,
+      );
+      onCorpusUpdated();
+    } catch (error) {
+      setImportError(
+        error instanceof Error
+          ? error.message
+          : "Nie udało się zaakceptować propozycji.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+  function switchView(view: CorpusView) {
+    setActiveView(view);
+    setSelectedIds(new Set());
   }
   useEffect(() => {
     if (!selectedExample) return;
@@ -1233,7 +2395,7 @@ function CorporaPage({
   });
   const systemPromptGroups = (() => {
     const groups = new Map<string, Example[]>();
-    examples.forEach((example) => {
+    corpusExamples.forEach((example) => {
       const prompt = example.messages.find(
         (message) => message.role === "system",
       )?.content;
@@ -1250,1026 +2412,1463 @@ function CorporaPage({
     ([, items]) => items.length === 1,
   ).length;
   return (
-    <MediumPageTemplate
-      eyebrow="PRZEGLĄD"
-      title={`Encje JSONL${selectedCorpus ? `: ${selectedCorpus.name}` : ""}`}
-      actions={
-        <div className="d-flex flex-column gap-2 align-self-start">
-          <div className="d-flex flex-wrap gap-2">
-            <div className="input-group input-group-sm export-control">
-              <select
-                className="form-select"
-                value={exportSplit}
-                disabled={!selectedCorpus}
-                onChange={(event) =>
-                  setExportSplit(event.target.value as Split)
-                }
-                aria-label="Split eksportu"
-              >
-                <option value="train">train</option>
-                <option value="validation">validation</option>
-                <option value="test">test</option>
-              </select>
-              {selectedCorpus ? (
-                <a
-                  className="btn btn-outline-primary"
-                  href={`/api/corpora/${selectedCorpus.id}/export?split=${exportSplit}`}
-                  download={`corpus-${selectedCorpus.id}-${exportSplit}.jsonl`}
-                >
-                  <Download size={17} className="me-1" /> Eksportuj
-                </a>
-              ) : (
-                <button
-                  className="btn btn-outline-primary"
-                  type="button"
-                  disabled
-                >
-                  <Download size={17} className="me-1" /> Eksportuj
-                </button>
-              )}
-            </div>
-            <div className="input-group input-group-sm export-control">
-              <select
-                className="form-select"
-                value={importSplit}
-                disabled={busy || !selectedCorpus}
-                onChange={(event) =>
-                  setImportSplit(event.target.value as Split)
-                }
-                aria-label="Domyślny split importu"
-              >
-                <option value="train">train</option>
-                <option value="validation">validation</option>
-                <option value="test">test</option>
-              </select>
-              <label className="btn btn-outline-primary mb-0">
-                <FileUp size={17} className="me-1" /> Importuj JSONL
-                <input
-                  className="visually-hidden"
-                  type="file"
-                  accept=".jsonl,.ndjson,application/json"
-                  disabled={busy || !selectedCorpus}
-                  onChange={(event) => void importEntities(event)}
-                />
-              </label>
-            </div>
-            <button
-              className="btn btn-primary"
-              type="button"
-              disabled={!selectedCorpus}
-              onClick={() => navigate(`/builder/${selectedCorpus?.id}`)}
-            >
-              <FilePlus2 size={17} className="me-1" /> Dodaj encję
-            </button>
-          </div>
-        </div>
-      }
+    <div
+      className="corpora-split"
+      ref={splitRef}
+      style={{
+        gridTemplateColumns: agentWidth
+          ? `minmax(0, 1fr) 6px ${agentWidth}px`
+          : "minmax(0, 2fr) 6px 1fr",
+      }}
     >
-      {lastRevision && (
-        <div className="alert alert-info d-flex justify-content-between align-items-center gap-2">
-          <span>Przekształcono odpowiedzi: {lastRevision.count}.</span>
-          <span className="d-flex gap-2">
-            <button
-              className="btn btn-sm btn-info"
-              type="button"
-              disabled={busy}
-              onClick={() => void revertTransform()}
-            >
-              Cofnij
-            </button>
-            <button
-              className="btn btn-sm btn-outline-secondary"
-              type="button"
-              onClick={() => setLastRevision(null)}
-            >
-              <X size={14} />
-            </button>
-          </span>
-        </div>
-      )}
-      {lastDeletion && (
-        <div className="alert alert-warning d-flex justify-content-between align-items-center gap-2">
-          <span>Usunięto encje: {lastDeletion.count}.</span>
-          <span className="d-flex gap-2">
-            <button
-              className="btn btn-sm btn-warning"
-              type="button"
-              disabled={busy}
-              onClick={() => void undoDeletion()}
-            >
-              Cofnij
-            </button>
-            <button
-              className="btn btn-sm btn-outline-secondary"
-              type="button"
-              onClick={() => setLastDeletion(null)}
-            >
-              <X size={14} />
-            </button>
-          </span>
-        </div>
-      )}
-      {importNotice && (
-        <div className="alert alert-success">{importNotice}</div>
-      )}
-      {importError && <div className="alert alert-danger">{importError}</div>}
-      <nav className="nav nav-tabs mb-3" aria-label="Widok encji">
-        <button
-          className={`nav-link ${activeView === "list" ? "active" : ""}`}
-          type="button"
-          onClick={() => setActiveView("list")}
-        >
-          Lista
-        </button>
-        <button
-          className={`nav-link ${activeView === "duplicates" ? "active" : ""}`}
-          type="button"
-          onClick={() => setActiveView("duplicates")}
-        >
-          Duplikaty{" "}
-          {duplicateSystemPromptGroups.length
-            ? `(${duplicateSystemPromptGroups.length})`
-            : ""}
-        </button>
-      </nav>
-      {activeView === "list" && (
-        <>
-          <div className="row g-2 mb-3">
-            <div className="col-12 col-md">
-              <input
-                className="form-control"
-                placeholder="Filtruj treść encji"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-              />
-            </div>
-            <div className="col-6 col-md-auto">
-              <select
-                className="form-select"
-                value={splitFilter}
-                onChange={(event) =>
-                  setSplitFilter(event.target.value as Split | "")
-                }
-              >
-                <option value="">Wszystkie splity</option>
-                <option value="train">train</option>
-                <option value="validation">validation</option>
-                <option value="test">test</option>
-              </select>
-            </div>
-            <div className="col-6 col-md-auto">
-              <select
-                className="form-select"
-                value={flagFilter}
-                onChange={(event) =>
-                  setFlagFilter(event.target.value as ExampleFlag | "")
-                }
-              >
-                <option value="">Wszystkie klasy</option>
-                <option value="unclassified">do klasyfikacji</option>
-                <option value="positive">pozytywny</option>
-                <option value="negative">negatywny</option>
-              </select>
-            </div>
-          </div>
-          <details className="advanced-filters mb-3">
-            <summary>Filtry zaawansowane</summary>
-            <div className="row g-2 mt-1">
-              <div className="col-12 col-md-auto">
+      <MediumPageTemplate
+        eyebrow="PRZEGLĄD"
+        title={`Encje JSONL${selectedCorpus ? `: ${selectedCorpus.name}` : ""}`}
+        actions={
+          <div className="d-flex flex-column gap-2 align-self-start">
+            <div className="d-flex flex-wrap gap-2">
+              <div className="input-group input-group-sm export-control">
                 <select
                   className="form-select"
-                  value={importFilter}
-                  onChange={(event) => setImportFilter(event.target.value)}
-                >
-                  <option value="">Wszystkie importy</option>
-                  <option value="manual">Dodane ręcznie</option>
-                  {importBatches.map((batch) => (
-                    <option key={batch} value={batch}>
-                      {batch}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="col-6 col-md-auto">
-                <input
-                  className="form-control"
-                  type="date"
-                  aria-label="Data od"
-                  value={fromDate}
-                  onChange={(event) => setFromDate(event.target.value)}
-                />
-              </div>
-              <div className="col-6 col-md-auto">
-                <input
-                  className="form-control"
-                  type="date"
-                  aria-label="Data do"
-                  value={toDate}
-                  onChange={(event) => setToDate(event.target.value)}
-                />
-              </div>
-            </div>
-          </details>
-          <div className="automatic-classification mb-3">
-            <div>
-              <p className="panel-title mb-1">AUTOMATYCZNA KLASYFIKACJA</p>
-              <small className="text-secondary">
-                Bielik przechodzi kolejno przez nieoznaczone encje z bieżących
-                filtrów.
-              </small>
-            </div>
-            {classification?.state === "running" ? (
-              <strong>
-                {classification.processed} / {classification.total}
-              </strong>
-            ) : (
-              <button
-                className="btn btn-sm btn-primary"
-                type="button"
-                disabled={busy || !automaticCandidates.length}
-                onClick={() => void startAutomaticClassification()}
-              >
-                <Sparkles size={15} className="me-1" /> Klasyfikuj automatycznie
-                ({automaticCandidates.length})
-              </button>
-            )}
-            {classification?.state === "completed" && (
-              <small className="text-secondary">
-                Gotowe: {classification.classified}; do ręcznej oceny:{" "}
-                {classification.needs_review}.
-              </small>
-            )}
-            {classification?.state === "failed" && (
-              <small className="text-danger">
-                {classification.error || "Klasyfikacja nie powiodła się."}
-              </small>
-            )}
-          </div>
-          {selectedIds.size > 0 && (
-            <div className="bulk-actions mb-3">
-              <strong>Zaznaczone: {selectedIds.size}</strong>
-              <div className="input-group input-group-sm bulk-split-control">
-                <select
-                  className="form-select"
-                  value={bulkSplit}
-                  disabled={busy}
+                  value={exportSplit}
+                  disabled={!selectedCorpus}
                   onChange={(event) =>
-                    setBulkSplit(event.target.value as Split)
+                    setExportSplit(event.target.value as ExampleSplit | "all")
                   }
-                  aria-label="Docelowy split zaznaczonych encji"
+                  aria-label="Split eksportu"
+                >
+                  <option value="all">wszystkie</option>
+                  <option value="train">train</option>
+                  <option value="validation">validation</option>
+                  <option value="test">test</option>
+                  <option value="unassigned">bez splitu</option>
+                </select>
+                {selectedCorpus ? (
+                  <a
+                    className="btn btn-outline-primary"
+                    href={`/api/corpora/${selectedCorpus.id}/export?split=${exportSplit}`}
+                    download={`corpus-${selectedCorpus.id}-${exportSplit}.jsonl`}
+                  >
+                    <Download size={17} className="me-1" /> Eksportuj
+                  </a>
+                ) : (
+                  <button
+                    className="btn btn-outline-primary"
+                    type="button"
+                    disabled
+                  >
+                    <Download size={17} className="me-1" /> Eksportuj
+                  </button>
+                )}
+              </div>
+              <div className="input-group input-group-sm export-control">
+                <select
+                  className="form-select"
+                  value={importSplit}
+                  disabled={busy || !selectedCorpus}
+                  onChange={(event) =>
+                    setImportSplit(event.target.value as Split)
+                  }
+                  aria-label="Domyślny split importu"
                 >
                   <option value="train">train</option>
                   <option value="validation">validation</option>
                   <option value="test">test</option>
                 </select>
-                <button
-                  className="btn btn-outline-primary"
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void applyBulkSplit()}
-                >
-                  Ustaw split
-                </button>
+                <label className="btn btn-outline-primary mb-0">
+                  <FileUp size={17} className="me-1" /> Importuj JSONL
+                  <input
+                    className="visually-hidden"
+                    type="file"
+                    accept=".jsonl,.ndjson,application/json"
+                    disabled={busy || !selectedCorpus}
+                    onChange={(event) => void importEntities(event)}
+                  />
+                </label>
               </div>
-              <div className="input-group input-group-sm random-split-control">
-                <span className="input-group-text">Walidacja</span>
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={!selectedCorpus}
+                onClick={() => navigate(`/builder/${selectedCorpus?.id}`)}
+              >
+                <FilePlus2 size={17} className="me-1" /> Dodaj encję
+              </button>
+            </div>
+          </div>
+        }
+      >
+        {lastRevision && (
+          <div className="alert alert-info d-flex justify-content-between align-items-center gap-2">
+            <span>Przekształcono odpowiedzi: {lastRevision.count}.</span>
+            <span className="d-flex gap-2">
+              <button
+                className="btn btn-sm btn-info"
+                type="button"
+                disabled={busy}
+                onClick={() => void revertTransform()}
+              >
+                Cofnij
+              </button>
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                type="button"
+                onClick={() => setLastRevision(null)}
+              >
+                <X size={14} />
+              </button>
+            </span>
+          </div>
+        )}
+        {lastDeletion && (
+          <div className="alert alert-warning d-flex justify-content-between align-items-center gap-2">
+            <span>Usunięto encje: {lastDeletion.count}.</span>
+            <span className="d-flex gap-2">
+              <button
+                className="btn btn-sm btn-warning"
+                type="button"
+                disabled={busy}
+                onClick={() => void undoDeletion()}
+              >
+                Cofnij
+              </button>
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                type="button"
+                onClick={() => setLastDeletion(null)}
+              >
+                <X size={14} />
+              </button>
+            </span>
+          </div>
+        )}
+        {importNotice && (
+          <div className="alert alert-success">{importNotice}</div>
+        )}
+        {importError && <div className="alert alert-danger">{importError}</div>}
+        <nav className="nav nav-tabs mb-3 mt-3" aria-label="Widok encji">
+          <button
+            className={`nav-link ${activeView === "analysis" ? "active" : ""}`}
+            type="button"
+            onClick={() => switchView("analysis")}
+          >
+            Analiza
+          </button>
+          <button
+            className={`nav-link ${activeView === "list" ? "active" : ""}`}
+            type="button"
+            onClick={() => switchView("list")}
+          >
+            Lista
+          </button>
+          <button
+            className={`nav-link ${activeView === "proposals" ? "active" : ""}`}
+            type="button"
+            onClick={() => switchView("proposals")}
+          >
+            Propozycje {proposals.length ? `(${proposals.length})` : ""}
+          </button>
+          <button
+            className={`nav-link ${activeView === "duplicates" ? "active" : ""}`}
+            type="button"
+            onClick={() => switchView("duplicates")}
+          >
+            Duplikaty{" "}
+            {duplicateSystemPromptGroups.length
+              ? `(${duplicateSystemPromptGroups.length})`
+              : ""}
+          </button>
+          <button
+            className={`nav-link ${activeView === "settings" ? "active" : ""}`}
+            type="button"
+            onClick={() => switchView("settings")}
+          >
+            Ustawienia
+          </button>
+        </nav>
+        {corpusId && activeView === "list" && (
+          <>
+            <div className="row g-2 mb-3">
+              <div className="col-12 col-md">
                 <input
                   className="form-control"
-                  type="number"
-                  min={1}
-                  max={99}
-                  value={validationPercent}
-                  disabled={busy}
-                  onChange={(event) =>
-                    setValidationPercent(
-                      Math.min(
-                        99,
-                        Math.max(1, Number(event.target.value) || 1),
-                      ),
-                    )
-                  }
-                  aria-label="Procent do walidacji"
+                  placeholder="Filtruj treść encji"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
                 />
-                <span className="input-group-text">%</span>
-                <button
-                  className="btn btn-outline-primary"
-                  type="button"
-                  disabled={busy || selectedIds.size < 2}
-                  onClick={() => void randomSplitSelected()}
-                  title="Losowo przypisz zaznaczone do train/validation"
-                >
-                  Losowy podział
-                </button>
               </div>
-              <button
-                className="btn btn-sm btn-outline-primary"
-                type="button"
-                disabled={busy}
-                onClick={() => void previewTransform()}
-              >
-                Transformacje
-              </button>
-              <button
-                className="btn btn-sm btn-danger ms-auto"
-                type="button"
-                disabled={busy}
-                onClick={() => void deleteSelected()}
-              >
-                <Trash2 size={15} className="me-1" /> Usuń
-              </button>
-            </div>
-          )}
-          {examplesLoading ? (
-            <div className="text-secondary">Wczytywanie encji...</div>
-          ) : filteredExamples.length ? (
-            <div className="list-group shadow-sm">
-              <label className="list-group-item d-flex align-items-center gap-2 entity-select-all">
-                <input
-                  type="checkbox"
-                  checked={filteredExamples.every((example) =>
-                    selectedIds.has(example.id),
-                  )}
-                  onChange={() =>
-                    setSelectedIds((current) => {
-                      const next = new Set(current);
-                      const allSelected = filteredExamples.every((example) =>
-                        next.has(example.id),
-                      );
-                      filteredExamples.forEach((example) =>
-                        allSelected
-                          ? next.delete(example.id)
-                          : next.add(example.id),
-                      );
-                      return next;
-                    })
+              <div className="col-6 col-md-auto">
+                <select
+                  className="form-select"
+                  value={splitFilter}
+                  onChange={(event) =>
+                    setSplitFilter(event.target.value as ExampleSplit | "")
                   }
-                />
-                Zaznacz widoczne ({filteredExamples.length})
-              </label>
-              {filteredExamples.map((example) => (
-                <div
-                  className={`list-group-item entity-list-item d-flex align-items-start gap-2 ${selectedExample?.id === example.id ? "selected" : ""}`}
-                  key={example.id}
                 >
-                  <input
-                    className="form-check-input mt-1"
-                    type="checkbox"
-                    checked={selectedIds.has(example.id)}
-                    onChange={() => toggleSelection(example.id)}
-                    aria-label="Zaznacz encję"
-                  />
-                  <button
-                    className="entity-select text-start"
-                    type="button"
-                    onClick={() => openDrawer(example)}
-                  >
-                    <span className="entity-list-content">
-                      <small className="entity-created d-block">
-                        {formatCreatedAt(example.created_at)}
-                      </small>
-                      <span className="d-flex flex-wrap gap-2 mb-1">
-                        <span className="badge text-bg-secondary">
-                          {example.corpus_name ?? selectedCorpus?.name}
-                        </span>
-                        <span className="badge text-bg-light border text-dark">
-                          {example.split}
-                        </span>
-                        <span
-                          className={`badge text-bg-${example.metadata.flag === "negative" ? "danger" : example.metadata.flag === "positive" ? "success" : "warning"}`}
-                        >
-                          {example.metadata.flag === "negative"
-                            ? "negatywny"
-                            : example.metadata.flag === "positive"
-                              ? "pozytywny"
-                              : "do klasyfikacji"}
-                        </span>
-                        {example.metadata.import_id && (
-                          <span className="badge text-bg-info">
-                            {example.metadata.import_id}
-                          </span>
-                        )}
-                      </span>
-                      <small className="d-block text-truncate">
-                        {example.messages.find(
-                          (message) => message.role === "user",
-                        )?.content || "Bez wiadomości użytkownika"}
-                      </small>
-                    </span>
-                  </button>
-                  <span className="d-flex align-items-start gap-2 ms-auto">
-                    <button
-                      className="btn btn-sm btn-outline-primary"
-                      type="button"
-                      title="Edytuj"
-                      aria-label="Edytuj"
-                      onClick={() =>
-                        navigate(
-                          `/builder/${example.corpus_id ?? corpusId}?edit=${example.id}`,
-                        )
-                      }
-                    >
-                      <Pencil size={15} />
-                    </button>
-                    <button
-                      className="btn btn-sm btn-outline-danger"
-                      type="button"
-                      title="Usuń"
-                      aria-label="Usuń"
-                      disabled={busy}
-                      onClick={() => void removeExample(example)}
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </span>
-                </div>
-              ))}
+                  <option value="">Wszystkie splity</option>
+                  <option value="train">train</option>
+                  <option value="validation">validation</option>
+                  <option value="test">test</option>
+                  <option value="unassigned">bez splitu</option>
+                </select>
+              </div>
+              <div className="col-6 col-md-auto">
+                <select
+                  className="form-select"
+                  value={flagFilter}
+                  onChange={(event) =>
+                    setFlagFilter(event.target.value as ExampleFlag | "")
+                  }
+                >
+                  <option value="">Wszystkie klasy</option>
+                  <option value="unclassified">do klasyfikacji</option>
+                  <option value="positive">pozytywny</option>
+                  <option value="negative">negatywny</option>
+                </select>
+              </div>
             </div>
-          ) : (
-            <div className="text-secondary">
-              Brak encji dla wybranych filtrów.
-            </div>
-          )}
-        </>
-      )}
-      {activeView === "duplicates" && (
-        <section>
-          <div className="d-flex flex-wrap gap-2 mb-3">
-            <span className="badge text-bg-secondary">
-              Unikalne prompty: {systemPromptGroups.length}
-            </span>
-            <span className="badge text-bg-light border text-dark">
-              Encje z promptem występującym raz: {uniqueSystemPromptCount}
-            </span>
-          </div>
-          <div className="d-flex flex-wrap gap-2 mb-3">
-            <small className="text-secondary">
-              Wybierz automatyczną albo ręczną zmianę promptu dla konkretnej
-              grupy.
-            </small>
-          </div>
-          {duplicateSystemPromptGroups.length ? (
-            <div className="list-group shadow-sm">
-              {duplicateSystemPromptGroups.map(([prompt, items]) => (
-                <div className="list-group-item" key={prompt}>
-                  <div className="d-flex justify-content-between gap-3">
-                    <div className="text-truncate flex-grow-1">
-                      <strong>{items.length} encji</strong>
-                      <small className="d-block text-secondary text-truncate">
-                        {prompt}
-                      </small>
-                    </div>
-                    <div className="d-flex align-items-center gap-2 flex-shrink-0">
-                      <span className="badge text-bg-warning">duplikat</span>
-                      <button
-                        className="btn btn-sm btn-outline-secondary"
-                        type="button"
-                        disabled={busy}
-                        onClick={() => openManualPromptVariant(prompt, items)}
-                      >
-                        <Pencil size={15} className="me-1" /> Deduplikuj ręcznie
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="text-secondary">
-              Brak grup z więcej niż 15 identycznymi system promptami.
-            </div>
-          )}
-        </section>
-      )}
-      {transformPreview && (
-        <div className="modal-backdrop show confirm-backdrop">
-          <div className="modal d-block" role="dialog" aria-modal="true">
-            <div className="modal-dialog modal-xl">
-              <div className="modal-content">
-                <div className="modal-header">
-                  <h2 className="h5 modal-title">Transformacje</h2>
-                </div>
-                <div className="modal-body">
+            <details className="advanced-filters mb-3">
+              <summary>Filtry zaawansowane</summary>
+              <div className="row g-2 mt-1">
+                <div className="col-12 col-md-auto">
                   <select
-                    className="form-select mb-2"
-                    value={transformName}
-                    disabled={busy}
-                    onChange={(event) =>
-                      void previewTransform(
-                        event.target.value as TransformName,
-                        transformIds,
-                      )
-                    }
-                    aria-label="Rodzaj przekształcenia"
+                    className="form-select"
+                    value={importFilter}
+                    onChange={(event) => setImportFilter(event.target.value)}
                   >
-                    {Object.entries(TRANSFORM_LABELS).map(([name, label]) => (
-                      <option key={name} value={name}>
-                        {label.title}
+                    <option value="">Wszystkie importy</option>
+                    <option value="manual">Dodane ręcznie</option>
+                    {importBatches.map((batch) => (
+                      <option key={batch} value={batch}>
+                        {batch}
                       </option>
                     ))}
                   </select>
-                  <p className="text-secondary small">
-                    {TRANSFORM_LABELS[transformName].description} Dotyczy tylko
-                    odpowiedzi asystenta; zmiana jest zapisywana z kopią
-                    oryginałów i można ją cofnąć.
-                  </p>
-                  <p className="mb-1">
-                    Do zmiany: <strong>{transformPreview.matched}</strong> z{" "}
-                    {transformIds.length}
-                  </p>
-                  {Object.entries(transformPreview.skipped).map(
-                    ([reason, count]) => (
-                      <div className="small text-secondary" key={reason}>
-                        Pominięte ({reason}): {count}
-                      </div>
-                    ),
-                  )}
-                  {transformPreview.samples.map((sample) => (
-                    <div className="row g-2 mt-2" key={sample.id}>
-                      <div className="col-12 col-lg-6">
-                        <div className="small text-secondary">Przed</div>
-                        <pre className="transform-sample">{sample.before}</pre>
-                      </div>
-                      <div className="col-12 col-lg-6">
-                        <div className="small text-secondary">Po</div>
-                        <pre className="transform-sample">{sample.after}</pre>
-                      </div>
-                    </div>
-                  ))}
                 </div>
-                <div className="modal-footer">
-                  <button
-                    className="btn btn-outline-secondary"
-                    type="button"
-                    onClick={() => setTransformPreview(null)}
-                  >
-                    Anuluj
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={busy || !transformPreview.matched}
-                    onClick={() => void applyTransform()}
-                  >
-                    Zastosuj do {transformPreview.matched}
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-      {importSession && (
-        <div className="modal-backdrop show confirm-backdrop">
-          <div className="modal d-block" role="dialog" aria-modal="true">
-            <div className="modal-dialog modal-lg">
-              <div className="modal-content">
-                <div className="modal-header">
-                  <h2 className="h5 modal-title">Mapowanie importu</h2>
-                </div>
-                <div className="modal-body">
-                  <p className="mb-3">
-                    Wykryto rekordy:{" "}
-                    <strong>{importSession.records.length}</strong>
-                  </p>
-                  {importSession.adapter === "mapping" &&
-                    corpusDtoProblem(importSession.records) && (
-                      <div className="alert alert-warning small">
-                        Plik nie został rozpoznany jako gotowy format korpusu:{" "}
-                        {corpusDtoProblem(importSession.records)}
-                      </div>
-                    )}
-                  <p className="text-secondary small">
-                    {importSession.adapter === "owu-annotations"
-                      ? "Wykryto DTO OWU annotations. Importer zbuduje wiadomości z task, labels, text i target."
-                      : "Wybierz klucze wejściowego DTO dla pól encji korpusu. Gdy mapujesz messages, pola ról są ignorowane."}
-                  </p>
-                  {importSession.adapter === "owu-annotations" ? (
-                    <div className="alert alert-info mb-0">
-                      <code>target</code> zostanie zapisany jako odpowiedź
-                      asystenta, a pusty wynik jako klasa <code>negative</code>.
-                    </div>
-                  ) : (
-                    <div className="row g-3">
-                      {importTargets.map(({ key, label }) => (
-                        <label className="col-12 col-md-6" key={key}>
-                          <span className="form-label">{label}</span>
-                          <select
-                            className="form-select"
-                            value={importSession.mapping[key]}
-                            onChange={(event) =>
-                              setImportSession((current) =>
-                                current
-                                  ? {
-                                      ...current,
-                                      mapping: {
-                                        ...current.mapping,
-                                        [key]: event.target.value,
-                                      },
-                                    }
-                                  : null,
-                              )
-                            }
-                          >
-                            <option value="">Nie mapuj</option>
-                            {importSession.keys.map((sourceKey) => (
-                              <option key={sourceKey} value={sourceKey}>
-                                {sourceKey}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                  {importError && (
-                    <div className="alert alert-danger mt-3 mb-0">
-                      {importError}
-                    </div>
-                  )}
-                </div>
-                <div className="modal-footer">
-                  <button
-                    className="btn btn-outline-secondary"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => setImportSession(null)}
-                  >
-                    Anuluj
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void confirmImport()}
-                  >
-                    Zatwierdź import
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-      {manualPromptOpen && (
-        <div
-          className="modal-backdrop show confirm-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget)
-              setManualPromptOpen(false);
-          }}
-        >
-          <div className="modal d-block" role="dialog" aria-modal="true">
-            <div className="modal-dialog modal-prompt-comparison">
-              <div className="modal-content">
-                <div className="modal-header">
-                  <h2 className="h5 modal-title">
-                    {manualPromptSource === "randomized"
-                      ? "Propozycja skrócenia promptu"
-                      : "Ręczna zmiana system promptu"}
-                  </h2>
-                </div>
-                <div className="modal-body">
-                  {manualPromptSource === "randomized" && (
-                    <div className="alert alert-info">
-                      Bielik wygenerował skróconą propozycję. Przejrzyj ją, a
-                      następnie porównaj przed zapisem.
-                    </div>
-                  )}
-                  <label className="form-label">Co którą encję zmienić?</label>
+                <div className="col-6 col-md-auto">
                   <input
-                    className="form-control mb-3"
-                    type="number"
-                    min={2}
-                    max={100}
-                    value={manualEvery}
+                    className="form-control"
+                    type="date"
+                    aria-label="Data od"
+                    value={fromDate}
+                    onChange={(event) => setFromDate(event.target.value)}
+                  />
+                </div>
+                <div className="col-6 col-md-auto">
+                  <input
+                    className="form-control"
+                    type="date"
+                    aria-label="Data do"
+                    value={toDate}
+                    onChange={(event) => setToDate(event.target.value)}
+                  />
+                </div>
+              </div>
+            </details>
+            <div className="automatic-classification mb-3">
+              <div>
+                <p className="panel-title mb-1">AUTOMATYCZNA KLASYFIKACJA</p>
+                <small className="text-secondary">
+                  Bielik przechodzi kolejno przez nieoznaczone encje z bieżących
+                  filtrów.
+                </small>
+              </div>
+              {classification?.state === "running" ? (
+                <strong>
+                  {classification.processed} / {classification.total}
+                </strong>
+              ) : (
+                <button
+                  className="btn btn-sm btn-primary"
+                  type="button"
+                  disabled={busy || !automaticCandidates.length}
+                  onClick={() => void startAutomaticClassification()}
+                >
+                  <Sparkles size={15} className="me-1" /> Klasyfikuj
+                  automatycznie ({automaticCandidates.length})
+                </button>
+              )}
+              {classification?.state === "completed" && (
+                <small className="text-secondary">
+                  Gotowe: {classification.classified}; do ręcznej oceny:{" "}
+                  {classification.needs_review}.
+                </small>
+              )}
+              {classification?.state === "failed" && (
+                <small className="text-danger">
+                  {classification.error || "Klasyfikacja nie powiodła się."}
+                </small>
+              )}
+            </div>
+            {selectedIds.size > 0 && (
+              <div className="bulk-actions mb-3">
+                <strong>Zaznaczone: {selectedIds.size}</strong>
+                <div className="input-group input-group-sm bulk-split-control">
+                  <select
+                    className="form-select"
+                    value={bulkSplit}
+                    disabled={busy}
                     onChange={(event) =>
-                      setManualEvery(
+                      setBulkSplit(event.target.value as ExampleSplit)
+                    }
+                    aria-label="Docelowy split zaznaczonych encji"
+                  >
+                    <option value="train">train</option>
+                    <option value="validation">validation</option>
+                    <option value="test">test</option>
+                    <option value="unassigned">bez splitu</option>
+                  </select>
+                  <button
+                    className="btn btn-outline-primary"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void applyBulkSplit()}
+                  >
+                    Ustaw split
+                  </button>
+                </div>
+                <div className="input-group input-group-sm random-split-control">
+                  <span className="input-group-text">Walidacja</span>
+                  <input
+                    className="form-control"
+                    type="number"
+                    min={1}
+                    max={99}
+                    value={validationPercent}
+                    disabled={busy}
+                    onChange={(event) =>
+                      setValidationPercent(
                         Math.min(
-                          100,
-                          Math.max(2, Number(event.target.value) || 2),
+                          99,
+                          Math.max(1, Number(event.target.value) || 1),
                         ),
                       )
                     }
+                    aria-label="Procent do walidacji"
                   />
-                  <p className="text-secondary">
-                    Zmieniony prompt zostanie użyty w około{" "}
-                    {Math.floor(manualPromptIds.length / manualEvery)} z{" "}
-                    {manualPromptIds.length} encji tej grupy.
-                  </p>
-                  <div className="row g-3 mb-3">
-                    <div className="col-12 col-md-6">
-                      <label className="form-label">Dostawca parafrazy</label>
-                      <select
-                        className="form-select"
-                        value={paraphraseProvider}
-                        disabled={
-                          paraphrasingPrompt ||
-                          paraphrasingSelection ||
-                          !Object.keys(paraphraseProviders).length
+                  <span className="input-group-text">%</span>
+                  <button
+                    className="btn btn-outline-primary"
+                    type="button"
+                    disabled={busy || selectedIds.size < 2}
+                    onClick={() => void randomSplitSelected()}
+                    title="Losowo przypisz zaznaczone do train/validation"
+                  >
+                    Losowy podział
+                  </button>
+                </div>
+                <button
+                  className="btn btn-sm btn-outline-primary"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void previewTransform()}
+                >
+                  Transformacje
+                </button>
+                <button
+                  className="btn btn-sm btn-danger ms-auto"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void deleteSelected()}
+                >
+                  <Trash2 size={15} className="me-1" /> Usuń
+                </button>
+              </div>
+            )}
+            {examplesLoading ? (
+              <div className="text-secondary">Wczytywanie encji...</div>
+            ) : filteredExamples.length ? (
+              <div className="list-group shadow-sm">
+                <label className="list-group-item d-flex align-items-center gap-2 entity-select-all">
+                  <input
+                    type="checkbox"
+                    checked={filteredExamples.every((example) =>
+                      selectedIds.has(example.id),
+                    )}
+                    onChange={() =>
+                      setSelectedIds((current) => {
+                        const next = new Set(current);
+                        const allSelected = filteredExamples.every((example) =>
+                          next.has(example.id),
+                        );
+                        filteredExamples.forEach((example) =>
+                          allSelected
+                            ? next.delete(example.id)
+                            : next.add(example.id),
+                        );
+                        return next;
+                      })
+                    }
+                  />
+                  Zaznacz widoczne ({filteredExamples.length})
+                </label>
+                {filteredExamples.map((example) => (
+                  <div
+                    className={`list-group-item entity-list-item d-flex align-items-start gap-2 ${selectedExample?.id === example.id ? "selected" : ""}`}
+                    key={example.id}
+                  >
+                    <input
+                      className="form-check-input mt-1"
+                      type="checkbox"
+                      checked={selectedIds.has(example.id)}
+                      onChange={() => toggleSelection(example.id)}
+                      aria-label="Zaznacz encję"
+                    />
+                    <button
+                      className="entity-select text-start"
+                      type="button"
+                      onClick={() => openDrawer(example)}
+                    >
+                      <span className="entity-list-content">
+                        <small className="entity-created d-block">
+                          {formatCreatedAt(example.created_at)}
+                        </small>
+                        <span className="d-flex flex-wrap gap-2 mb-1">
+                          <span className="badge text-bg-secondary">
+                            {example.corpus_name ?? selectedCorpus?.name}
+                          </span>
+                          <span
+                            className={`badge border ${example.split === "unassigned" ? "text-bg-warning" : "text-bg-light text-dark"}`}
+                            title={
+                              example.split === "unassigned"
+                                ? "Poza treningiem — przywróć splitem albo usuń na stałe"
+                                : undefined
+                            }
+                          >
+                            {splitLabel(example.split)}
+                          </span>
+                          <span
+                            className={`badge text-bg-${example.metadata.flag === "negative" ? "danger" : example.metadata.flag === "positive" ? "success" : "warning"}`}
+                          >
+                            {example.metadata.flag === "negative"
+                              ? "negatywny"
+                              : example.metadata.flag === "positive"
+                                ? "pozytywny"
+                                : "do klasyfikacji"}
+                          </span>
+                          {example.metadata.import_id && (
+                            <span className="badge text-bg-info">
+                              {example.metadata.import_id}
+                            </span>
+                          )}
+                        </span>
+                        <small className="d-block text-truncate">
+                          {example.messages.find(
+                            (message) => message.role === "user",
+                          )?.content || "Bez wiadomości użytkownika"}
+                        </small>
+                      </span>
+                    </button>
+                    <span className="d-flex align-items-start gap-2 ms-auto">
+                      <button
+                        className="btn btn-sm btn-outline-primary"
+                        type="button"
+                        title="Edytuj"
+                        aria-label="Edytuj"
+                        onClick={() =>
+                          navigate(
+                            `/builder/${example.corpus_id ?? corpusId}?edit=${example.id}`,
+                          )
                         }
-                        onChange={(event) => {
-                          const provider = event.target.value;
-                          setParaphraseProvider(provider);
-                          setParaphraseModel(
-                            Object.keys(
-                              paraphraseProviders[provider]?.models ?? {},
-                            )[0] ?? "",
-                          );
-                        }}
                       >
-                        {Object.entries(paraphraseProviders).map(
-                          ([provider, config]) => (
-                            <option key={provider} value={provider}>
-                              {config.label}
-                            </option>
-                          ),
-                        )}
-                      </select>
+                        <Pencil size={15} />
+                      </button>
+                      <button
+                        className="btn btn-sm btn-outline-danger"
+                        type="button"
+                        title="Usuń"
+                        aria-label="Usuń"
+                        disabled={busy}
+                        onClick={() => void removeExample(example)}
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-secondary">
+                Brak encji dla wybranych filtrów.
+              </div>
+            )}
+          </>
+        )}
+        {!corpusId && activeView !== "duplicates" && (
+          <div className="text-secondary">
+            {corpora.length
+              ? "Wybierz korpus z listy po lewej."
+              : "Brak korpusów — utwórz pierwszy przyciskiem „Nowy korpus”."}
+          </div>
+        )}
+        {corpusId && activeView === "proposals" && (
+          <section>
+            <p className="text-secondary small">
+              Przykłady zaproponowane przez asystenta. Nie trafiają do treningu,
+              ewaluacji ani eksportu, dopóki ich nie zaakceptujesz — akceptacja
+              nadaje flagę zaproponowaną przez asystenta.
+            </p>
+            {proposals.length ? (
+              <>
+                <div className="bulk-actions mb-3">
+                  <label className="d-flex align-items-center gap-2 mb-0">
+                    <input
+                      type="checkbox"
+                      checked={proposals.every((example) =>
+                        selectedIds.has(example.id),
+                      )}
+                      onChange={() =>
+                        setSelectedIds(
+                          proposals.every((example) =>
+                            selectedIds.has(example.id),
+                          )
+                            ? new Set()
+                            : new Set(proposals.map((example) => example.id)),
+                        )
+                      }
+                    />
+                    Zaznacz wszystkie ({proposals.length})
+                  </label>
+                  <button
+                    className="btn btn-sm btn-success ms-auto"
+                    type="button"
+                    disabled={busy || !selectedIds.size}
+                    onClick={() => void acceptProposals([...selectedIds])}
+                  >
+                    <Check size={15} className="me-1" /> Akceptuj (
+                    {selectedIds.size})
+                  </button>
+                  <button
+                    className="btn btn-sm btn-outline-danger"
+                    type="button"
+                    disabled={busy || !selectedIds.size}
+                    onClick={() => void deleteSelected()}
+                  >
+                    <Trash2 size={15} className="me-1" /> Odrzuć (
+                    {selectedIds.size})
+                  </button>
+                </div>
+                <div className="list-group shadow-sm">
+                  {proposals.map((example) => {
+                    const exchanges = example.messages.filter(
+                      (message) => message.role === "user",
+                    ).length;
+                    return (
+                      <div
+                        className={`list-group-item entity-list-item d-flex align-items-start gap-2 ${selectedExample?.id === example.id ? "selected" : ""}`}
+                        key={example.id}
+                      >
+                        <input
+                          className="form-check-input mt-1"
+                          type="checkbox"
+                          checked={selectedIds.has(example.id)}
+                          onChange={() => toggleSelection(example.id)}
+                          aria-label="Zaznacz propozycję"
+                        />
+                        <button
+                          className="entity-select text-start"
+                          type="button"
+                          onClick={() => openDrawer(example)}
+                        >
+                          <span className="entity-list-content">
+                            <small className="entity-created d-block">
+                              {formatCreatedAt(example.created_at)}
+                            </small>
+                            <span className="d-flex flex-wrap gap-2 mb-1">
+                              <span className="badge text-bg-primary">
+                                propozycja
+                              </span>
+                              <span
+                                className={`badge text-bg-${example.metadata.proposed_flag === "negative" ? "danger" : "success"}`}
+                              >
+                                {example.metadata.proposed_flag === "negative"
+                                  ? "negatywny"
+                                  : "pozytywny"}
+                              </span>
+                              <span className="badge text-bg-light border text-dark">
+                                {example.split}
+                              </span>
+                              {example.metadata.replaces && (
+                                <span
+                                  className="badge text-bg-warning"
+                                  title="Po akceptacji oryginał trafi do kosza"
+                                >
+                                  naprawa · zastępuje{" "}
+                                  {example.metadata.replaces.slice(0, 8)}
+                                </span>
+                              )}
+                              {exchanges > 1 && (
+                                <span className="badge text-bg-light border text-dark">
+                                  {exchanges} wymiany
+                                </span>
+                              )}
+                              {!example.messages.some(
+                                (message) => message.role === "system",
+                              ) && (
+                                <span className="badge text-bg-light border text-dark">
+                                  bez system promptu
+                                </span>
+                              )}
+                            </span>
+                            <small className="d-block text-truncate">
+                              {example.messages.find(
+                                (message) => message.role === "user",
+                              )?.content || "Bez wiadomości użytkownika"}
+                            </small>
+                          </span>
+                        </button>
+                        <span className="d-flex align-items-start gap-2 ms-auto">
+                          <button
+                            className="btn btn-sm btn-outline-success"
+                            type="button"
+                            title="Akceptuj"
+                            aria-label="Akceptuj"
+                            disabled={busy}
+                            onClick={() => void acceptProposals([example.id])}
+                          >
+                            <Check size={15} />
+                          </button>
+                          <button
+                            className="btn btn-sm btn-outline-danger"
+                            type="button"
+                            title="Odrzuć"
+                            aria-label="Odrzuć"
+                            disabled={busy}
+                            onClick={() => void removeExample(example)}
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            ) : (
+              <div className="text-secondary">
+                Brak propozycji — poproś asystenta o nowe przykłady.
+              </div>
+            )}
+          </section>
+        )}
+        {corpusId && activeView === "settings" && (
+          <CorpusSettingsView corpusId={corpusId} onSaved={onCorpusUpdated} />
+        )}
+        {corpusId && activeView === "analysis" && (
+          <CorpusAnalysisView
+            analysis={analysis}
+            loading={analysisLoading}
+            onRefresh={loadAnalysis}
+            onOpenExample={(exampleId) => {
+              const example = examples.find((item) => item.id === exampleId);
+              if (example) openDrawer(example);
+            }}
+          />
+        )}
+        {activeView === "duplicates" && (
+          <section>
+            <div className="d-flex flex-wrap gap-2 mb-3">
+              <span className="badge text-bg-secondary">
+                Unikalne prompty: {systemPromptGroups.length}
+              </span>
+              <span className="badge text-bg-light border text-dark">
+                Encje z promptem występującym raz: {uniqueSystemPromptCount}
+              </span>
+            </div>
+            <div className="d-flex flex-wrap gap-2 mb-3">
+              <small className="text-secondary">
+                Wybierz automatyczną albo ręczną zmianę promptu dla konkretnej
+                grupy.
+              </small>
+            </div>
+            {duplicateSystemPromptGroups.length ? (
+              <div className="list-group shadow-sm">
+                {duplicateSystemPromptGroups.map(([prompt, items]) => (
+                  <div className="list-group-item" key={prompt}>
+                    <div className="d-flex justify-content-between gap-3">
+                      <div className="text-truncate flex-grow-1">
+                        <strong>{items.length} encji</strong>
+                        <small className="d-block text-secondary text-truncate">
+                          {prompt}
+                        </small>
+                      </div>
+                      <div className="d-flex align-items-center gap-2 flex-shrink-0">
+                        <span className="badge text-bg-warning">duplikat</span>
+                        <button
+                          className="btn btn-sm btn-outline-secondary"
+                          type="button"
+                          disabled={busy}
+                          onClick={() => openManualPromptVariant(prompt, items)}
+                        >
+                          <Pencil size={15} className="me-1" /> Deduplikuj
+                          ręcznie
+                        </button>
+                      </div>
                     </div>
-                    {Object.keys(paraphraseModels).length > 0 && (
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-secondary">
+                Brak grup z więcej niż 15 identycznymi system promptami.
+              </div>
+            )}
+          </section>
+        )}
+        {transformPreview && (
+          <div className="modal-backdrop show confirm-backdrop">
+            <div className="modal d-block" role="dialog" aria-modal="true">
+              <div className="modal-dialog modal-xl">
+                <div className="modal-content">
+                  <div className="modal-header">
+                    <h2 className="h5 modal-title">Transformacje</h2>
+                  </div>
+                  <div className="modal-body">
+                    <select
+                      className="form-select mb-2"
+                      value={transformName}
+                      disabled={busy}
+                      onChange={(event) =>
+                        void previewTransform(
+                          event.target.value as TransformName,
+                          transformIds,
+                        )
+                      }
+                      aria-label="Rodzaj przekształcenia"
+                    >
+                      {Object.entries(TRANSFORM_LABELS).map(([name, label]) => (
+                        <option key={name} value={name}>
+                          {label.title}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-secondary small">
+                      {TRANSFORM_LABELS[transformName].description} Dotyczy
+                      tylko odpowiedzi asystenta; zmiana jest zapisywana z kopią
+                      oryginałów i można ją cofnąć.
+                    </p>
+                    <p className="mb-1">
+                      Do zmiany: <strong>{transformPreview.matched}</strong> z{" "}
+                      {transformIds.length}
+                    </p>
+                    {Object.entries(transformPreview.skipped).map(
+                      ([reason, count]) => (
+                        <div className="small text-secondary" key={reason}>
+                          Pominięte ({reason}): {count}
+                        </div>
+                      ),
+                    )}
+                    {transformPreview.samples.map((sample) => (
+                      <div className="row g-2 mt-2" key={sample.id}>
+                        <div className="col-12 col-lg-6">
+                          <div className="small text-secondary">Przed</div>
+                          <pre className="transform-sample">
+                            {sample.before}
+                          </pre>
+                        </div>
+                        <div className="col-12 col-lg-6">
+                          <div className="small text-secondary">Po</div>
+                          <pre className="transform-sample">{sample.after}</pre>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="modal-footer">
+                    <button
+                      className="btn btn-outline-secondary"
+                      type="button"
+                      onClick={() => setTransformPreview(null)}
+                    >
+                      Anuluj
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={busy || !transformPreview.matched}
+                      onClick={() => void applyTransform()}
+                    >
+                      Zastosuj do {transformPreview.matched}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {importSession && (
+          <div className="modal-backdrop show confirm-backdrop">
+            <div className="modal d-block" role="dialog" aria-modal="true">
+              <div className="modal-dialog modal-lg">
+                <div className="modal-content">
+                  <div className="modal-header">
+                    <h2 className="h5 modal-title">Mapowanie importu</h2>
+                  </div>
+                  <div className="modal-body">
+                    <p className="mb-3">
+                      Wykryto rekordy:{" "}
+                      <strong>{importSession.records.length}</strong>
+                    </p>
+                    {importSession.adapter === "mapping" &&
+                      corpusDtoProblem(importSession.records) && (
+                        <div className="alert alert-warning small">
+                          Plik nie został rozpoznany jako gotowy format korpusu:{" "}
+                          {corpusDtoProblem(importSession.records)}
+                        </div>
+                      )}
+                    <p className="text-secondary small">
+                      {importSession.adapter === "owu-annotations"
+                        ? "Wykryto DTO OWU annotations. Importer zbuduje wiadomości z task, labels, text i target."
+                        : "Wybierz klucze wejściowego DTO dla pól encji korpusu. Gdy mapujesz messages, pola ról są ignorowane."}
+                    </p>
+                    {importSession.adapter === "owu-annotations" ? (
+                      <div className="alert alert-info mb-0">
+                        <code>target</code> zostanie zapisany jako odpowiedź
+                        asystenta, a pusty wynik jako klasa{" "}
+                        <code>negative</code>.
+                      </div>
+                    ) : (
+                      <div className="row g-3">
+                        {importTargets.map(({ key, label }) => (
+                          <label className="col-12 col-md-6" key={key}>
+                            <span className="form-label">{label}</span>
+                            <select
+                              className="form-select"
+                              value={importSession.mapping[key]}
+                              onChange={(event) =>
+                                setImportSession((current) =>
+                                  current
+                                    ? {
+                                        ...current,
+                                        mapping: {
+                                          ...current.mapping,
+                                          [key]: event.target.value,
+                                        },
+                                      }
+                                    : null,
+                                )
+                              }
+                            >
+                              <option value="">Nie mapuj</option>
+                              {importSession.keys.map((sourceKey) => (
+                                <option key={sourceKey} value={sourceKey}>
+                                  {sourceKey}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                    {importError && (
+                      <div className="alert alert-danger mt-3 mb-0">
+                        {importError}
+                      </div>
+                    )}
+                  </div>
+                  <div className="modal-footer">
+                    <button
+                      className="btn btn-outline-secondary"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => setImportSession(null)}
+                    >
+                      Anuluj
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void confirmImport()}
+                    >
+                      Zatwierdź import
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {manualPromptOpen && (
+          <div
+            className="modal-backdrop show confirm-backdrop"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget)
+                setManualPromptOpen(false);
+            }}
+          >
+            <div className="modal d-block" role="dialog" aria-modal="true">
+              <div className="modal-dialog modal-prompt-comparison">
+                <div className="modal-content">
+                  <div className="modal-header">
+                    <h2 className="h5 modal-title">
+                      {manualPromptSource === "randomized"
+                        ? "Propozycja skrócenia promptu"
+                        : "Ręczna zmiana system promptu"}
+                    </h2>
+                  </div>
+                  <div className="modal-body">
+                    {manualPromptSource === "randomized" && (
+                      <div className="alert alert-info">
+                        Bielik wygenerował skróconą propozycję. Przejrzyj ją, a
+                        następnie porównaj przed zapisem.
+                      </div>
+                    )}
+                    <label className="form-label">
+                      Co którą encję zmienić?
+                    </label>
+                    <input
+                      className="form-control mb-3"
+                      type="number"
+                      min={2}
+                      max={100}
+                      value={manualEvery}
+                      onChange={(event) =>
+                        setManualEvery(
+                          Math.min(
+                            100,
+                            Math.max(2, Number(event.target.value) || 2),
+                          ),
+                        )
+                      }
+                    />
+                    <p className="text-secondary">
+                      Zmieniony prompt zostanie użyty w około{" "}
+                      {Math.floor(manualPromptIds.length / manualEvery)} z{" "}
+                      {manualPromptIds.length} encji tej grupy.
+                    </p>
+                    <div className="row g-3 mb-3">
                       <div className="col-12 col-md-6">
-                        <label className="form-label">Model</label>
+                        <label className="form-label">Dostawca parafrazy</label>
                         <select
                           className="form-select"
-                          value={paraphraseModel}
-                          disabled={paraphrasingPrompt || paraphrasingSelection}
-                          onChange={(event) =>
-                            setParaphraseModel(event.target.value)
+                          value={paraphraseProvider}
+                          disabled={
+                            paraphrasingPrompt ||
+                            paraphrasingSelection ||
+                            !Object.keys(paraphraseProviders).length
                           }
+                          onChange={(event) => {
+                            const provider = event.target.value;
+                            setParaphraseProvider(provider);
+                            setParaphraseModel(
+                              Object.keys(
+                                paraphraseProviders[provider]?.models ?? {},
+                              )[0] ?? "",
+                            );
+                          }}
                         >
-                          {Object.entries(paraphraseModels).map(
-                            ([model, config]) => (
-                              <option key={model} value={model}>
+                          {Object.entries(paraphraseProviders).map(
+                            ([provider, config]) => (
+                              <option key={provider} value={provider}>
                                 {config.label}
                               </option>
                             ),
                           )}
                         </select>
                       </div>
-                    )}
-                  </div>
-                  <div className="row g-3">
-                    <div className="col-12 col-lg-6">
-                      <label className="form-label">Oryginalny prompt</label>
-                      <textarea
-                        className="form-control"
-                        rows={16}
-                        readOnly
-                        value={manualOriginalPrompt}
-                      />
-                    </div>
-                    <div className="col-12 col-lg-6">
-                      <label className="form-label">
-                        Skrócenie (edytowalne)
-                      </label>
-                      <textarea
-                        ref={manualPromptRef}
-                        className={`form-control ${promptFlash ? "prompt-flash" : ""}`}
-                        rows={16}
-                        value={manualPrompt}
-                        onChange={(event) => {
-                          setManualPrompt(event.target.value);
-                          setManualComparison(null);
-                          setPromptSelection(null);
-                        }}
-                        onSelect={(event) =>
-                          setPromptSelection({
-                            start: event.currentTarget.selectionStart,
-                            end: event.currentTarget.selectionEnd,
-                          })
-                        }
-                      />
-                      {manualPrompt.includes("\0") && (
-                        <div className="alert alert-warning mt-2 mb-0">
-                          Kandydat zawiera niewidoczny znak NUL, którego baza
-                          danych nie obsługuje.
-                          <button
-                            className="btn btn-sm btn-outline-danger ms-2"
-                            type="button"
-                            onClick={() => {
-                              setManualPrompt((prompt) =>
-                                prompt.replaceAll("\0", ""),
-                              );
-                              setManualComparison(null);
-                              setPromptSelection(null);
-                              setPromptModalError("");
-                            }}
+                      {Object.keys(paraphraseModels).length > 0 && (
+                        <div className="col-12 col-md-6">
+                          <label className="form-label">Model</label>
+                          <select
+                            className="form-select"
+                            value={paraphraseModel}
+                            disabled={
+                              paraphrasingPrompt || paraphrasingSelection
+                            }
+                            onChange={(event) =>
+                              setParaphraseModel(event.target.value)
+                            }
                           >
-                            Usuń znaki NUL
-                          </button>
+                            {Object.entries(paraphraseModels).map(
+                              ([model, config]) => (
+                                <option key={model} value={model}>
+                                  {config.label}
+                                </option>
+                              ),
+                            )}
+                          </select>
                         </div>
                       )}
                     </div>
-                  </div>
-                  {manualComparison && (
-                    <div
-                      className={`alert mt-3 mb-0 ${manualComparison.semantic_equivalent && manualComparison.instruction_plan_equivalent ? "alert-success" : "alert-danger"}`}
-                    >
-                      Zgodność semantyczna:{" "}
-                      {manualComparison.semantic_equivalent ? "tak" : "nie"}.
-                      Zgodność planu instrukcji:{" "}
-                      {manualComparison.instruction_plan_equivalent
-                        ? "tak"
-                        : "nie"}
-                      .
-                      <br />
-                      Uzasadnienie walidatora: {manualComparison.reason}
+                    <div className="row g-3">
+                      <div className="col-12 col-lg-6">
+                        <label className="form-label">Oryginalny prompt</label>
+                        <textarea
+                          className="form-control"
+                          rows={16}
+                          readOnly
+                          value={manualOriginalPrompt}
+                        />
+                      </div>
+                      <div className="col-12 col-lg-6">
+                        <label className="form-label">
+                          Skrócenie (edytowalne)
+                        </label>
+                        <textarea
+                          ref={manualPromptRef}
+                          className={`form-control ${promptFlash ? "prompt-flash" : ""}`}
+                          rows={16}
+                          value={manualPrompt}
+                          onChange={(event) => {
+                            setManualPrompt(event.target.value);
+                            setManualComparison(null);
+                            setPromptSelection(null);
+                          }}
+                          onSelect={(event) =>
+                            setPromptSelection({
+                              start: event.currentTarget.selectionStart,
+                              end: event.currentTarget.selectionEnd,
+                            })
+                          }
+                        />
+                        {manualPrompt.includes("\0") && (
+                          <div className="alert alert-warning mt-2 mb-0">
+                            Kandydat zawiera niewidoczny znak NUL, którego baza
+                            danych nie obsługuje.
+                            <button
+                              className="btn btn-sm btn-outline-danger ms-2"
+                              type="button"
+                              onClick={() => {
+                                setManualPrompt((prompt) =>
+                                  prompt.replaceAll("\0", ""),
+                                );
+                                setManualComparison(null);
+                                setPromptSelection(null);
+                                setPromptModalError("");
+                              }}
+                            >
+                              Usuń znaki NUL
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  )}
-                  {missingPromptTerms.length > 0 && (
-                    <div className="alert alert-warning mt-3 mb-0">
-                      W skróceniu brakuje terminów z oryginału:{" "}
-                      <strong>{missingPromptTerms.join(", ")}</strong>. Sprawdź
-                      je przed walidacją.
-                    </div>
-                  )}
-                  {promptModalError && (
-                    <div
-                      className="alert alert-danger mt-3 mb-0"
-                      style={{ whiteSpace: "pre-wrap" }}
+                    {manualComparison && (
+                      <div
+                        className={`alert mt-3 mb-0 ${manualComparison.semantic_equivalent && manualComparison.instruction_plan_equivalent ? "alert-success" : "alert-danger"}`}
+                      >
+                        Zgodność semantyczna:{" "}
+                        {manualComparison.semantic_equivalent ? "tak" : "nie"}.
+                        Zgodność planu instrukcji:{" "}
+                        {manualComparison.instruction_plan_equivalent
+                          ? "tak"
+                          : "nie"}
+                        .
+                        <br />
+                        Uzasadnienie walidatora: {manualComparison.reason}
+                      </div>
+                    )}
+                    {missingPromptTerms.length > 0 && (
+                      <div className="alert alert-warning mt-3 mb-0">
+                        W skróceniu brakuje terminów z oryginału:{" "}
+                        <strong>{missingPromptTerms.join(", ")}</strong>.
+                        Sprawdź je przed walidacją.
+                      </div>
+                    )}
+                    {promptModalError && (
+                      <div
+                        className="alert alert-danger mt-3 mb-0"
+                        style={{ whiteSpace: "pre-wrap" }}
+                      >
+                        {promptModalError}
+                      </div>
+                    )}
+                    <nav
+                      className="nav nav-tabs mt-3"
+                      aria-label="Prompty systemowe"
                     >
-                      {promptModalError}
-                    </div>
-                  )}
-                  <nav
-                    className="nav nav-tabs mt-3"
-                    aria-label="Prompty systemowe"
-                  >
-                    <button
-                      className={`nav-link ${promptTab === "paraphraser" ? "active" : ""}`}
-                      type="button"
-                      onClick={() => setPromptTab("paraphraser")}
-                    >
-                      Prompt parafrazera
-                    </button>
-                    <button
-                      className={`nav-link ${promptTab === "validator" ? "active" : ""}`}
-                      type="button"
-                      onClick={() => setPromptTab("validator")}
-                    >
-                      Prompt walidatora
-                    </button>
-                  </nav>
-                  <textarea
-                    className="form-control validator-prompt rounded-top-0"
-                    rows={5}
-                    disabled={
-                      promptTab === "paraphraser"
-                        ? !paraphraserPrompt
-                        : !validatorPrompt
-                    }
-                    placeholder="Wczytywanie..."
-                    value={
-                      promptTab === "paraphraser"
-                        ? paraphraserPrompt
-                        : validatorPrompt
-                    }
-                    onChange={(event) => {
-                      if (promptTab === "paraphraser") {
-                        setParaphraserPrompt(event.target.value);
-                      } else {
-                        setValidatorPrompt(event.target.value);
-                        setManualComparison(null);
+                      <button
+                        className={`nav-link ${promptTab === "paraphraser" ? "active" : ""}`}
+                        type="button"
+                        onClick={() => setPromptTab("paraphraser")}
+                      >
+                        Prompt parafrazera
+                      </button>
+                      <button
+                        className={`nav-link ${promptTab === "validator" ? "active" : ""}`}
+                        type="button"
+                        onClick={() => setPromptTab("validator")}
+                      >
+                        Prompt walidatora
+                      </button>
+                    </nav>
+                    <textarea
+                      className="form-control validator-prompt rounded-top-0"
+                      rows={5}
+                      disabled={
+                        promptTab === "paraphraser"
+                          ? !paraphraserPrompt
+                          : !validatorPrompt
                       }
-                    }}
-                  />
-                </div>
-                <div className="modal-footer">
-                  <button
-                    className="btn btn-outline-secondary"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => setManualPromptOpen(false)}
-                  >
-                    Anuluj
-                  </button>
-                  <button
-                    className="btn btn-outline-primary"
-                    type="button"
-                    disabled={
-                      busy ||
-                      comparingManualPrompt ||
-                      paraphrasingPrompt ||
-                      paraphrasingSelection ||
-                      !manualPrompt.trim()
-                    }
-                    onClick={() => void compareManualPrompt()}
-                  >
-                    {comparingManualPrompt
-                      ? "Walidowanie..."
-                      : "Waliduj skrócenie"}
-                  </button>
-                  <button
-                    className="btn btn-outline-primary"
-                    type="button"
-                    disabled={
-                      busy ||
-                      comparingManualPrompt ||
-                      paraphrasingPrompt ||
-                      paraphrasingSelection
-                    }
-                    onClick={() => void paraphraseManualPrompt()}
-                  >
-                    {paraphrasingPrompt ? (
-                      <>
-                        <span
-                          className="spinner-border spinner-border-sm me-1"
-                          aria-hidden="true"
-                        />{" "}
-                        Parafrazowanie...
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles size={15} className="me-1" /> Parafrazuj cały
-                        prompt
-                      </>
-                    )}
-                  </button>
-                  <button
-                    className="btn btn-outline-primary"
-                    type="button"
-                    disabled={
-                      busy ||
-                      comparingManualPrompt ||
-                      paraphrasingPrompt ||
-                      paraphrasingSelection ||
-                      !promptSelection ||
-                      promptSelection.start === promptSelection.end
-                    }
-                    onClick={() => void paraphraseSelectedPrompt()}
-                  >
-                    {paraphrasingSelection ? (
-                      <>
-                        <span
-                          className="spinner-border spinner-border-sm me-1"
-                          aria-hidden="true"
-                        />{" "}
-                        Parafrazowanie...
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles size={15} className="me-1" /> Parafrazuj
-                        zaznaczone
-                      </>
-                    )}
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={
-                      busy ||
-                      comparingManualPrompt ||
-                      paraphrasingPrompt ||
-                      paraphrasingSelection ||
-                      !manualPrompt.trim()
-                    }
-                    onClick={() => void applyManualPromptVariant()}
-                  >
-                    Zatwierdź i zapisz prompt
-                  </button>
+                      placeholder="Wczytywanie..."
+                      value={
+                        promptTab === "paraphraser"
+                          ? paraphraserPrompt
+                          : validatorPrompt
+                      }
+                      onChange={(event) => {
+                        if (promptTab === "paraphraser") {
+                          setParaphraserPrompt(event.target.value);
+                        } else {
+                          setValidatorPrompt(event.target.value);
+                          setManualComparison(null);
+                        }
+                      }}
+                    />
+                  </div>
+                  <div className="modal-footer">
+                    <button
+                      className="btn btn-outline-secondary"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => setManualPromptOpen(false)}
+                    >
+                      Anuluj
+                    </button>
+                    <button
+                      className="btn btn-outline-primary"
+                      type="button"
+                      disabled={
+                        busy ||
+                        comparingManualPrompt ||
+                        paraphrasingPrompt ||
+                        paraphrasingSelection ||
+                        !manualPrompt.trim()
+                      }
+                      onClick={() => void compareManualPrompt()}
+                    >
+                      {comparingManualPrompt
+                        ? "Walidowanie..."
+                        : "Waliduj skrócenie"}
+                    </button>
+                    <button
+                      className="btn btn-outline-primary"
+                      type="button"
+                      disabled={
+                        busy ||
+                        comparingManualPrompt ||
+                        paraphrasingPrompt ||
+                        paraphrasingSelection
+                      }
+                      onClick={() => void paraphraseManualPrompt()}
+                    >
+                      {paraphrasingPrompt ? (
+                        <>
+                          <span
+                            className="spinner-border spinner-border-sm me-1"
+                            aria-hidden="true"
+                          />{" "}
+                          Parafrazowanie...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles size={15} className="me-1" /> Parafrazuj
+                          cały prompt
+                        </>
+                      )}
+                    </button>
+                    <button
+                      className="btn btn-outline-primary"
+                      type="button"
+                      disabled={
+                        busy ||
+                        comparingManualPrompt ||
+                        paraphrasingPrompt ||
+                        paraphrasingSelection ||
+                        !promptSelection ||
+                        promptSelection.start === promptSelection.end
+                      }
+                      onClick={() => void paraphraseSelectedPrompt()}
+                    >
+                      {paraphrasingSelection ? (
+                        <>
+                          <span
+                            className="spinner-border spinner-border-sm me-1"
+                            aria-hidden="true"
+                          />{" "}
+                          Parafrazowanie...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles size={15} className="me-1" /> Parafrazuj
+                          zaznaczone
+                        </>
+                      )}
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={
+                        busy ||
+                        comparingManualPrompt ||
+                        paraphrasingPrompt ||
+                        paraphrasingSelection ||
+                        !manualPrompt.trim()
+                      }
+                      onClick={() => void applyManualPromptVariant()}
+                    >
+                      Zatwierdź i zapisz prompt
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
-      {selectedExample && (
-        <>
-          <button
-            className="entity-drawer-backdrop"
-            type="button"
-            aria-label="Zamknij podgląd"
-            onClick={closeDrawer}
-          />
-          <aside className="entity-drawer" aria-label="Podgląd encji">
-            <div className="entity-drawer-header">
-              <div>
-                <h2 className="h5 mb-1">Szczegóły encji</h2>
-                <small className="text-secondary">
-                  {formatCreatedAt(selectedExample.created_at)}
-                </small>
+        )}
+        {selectedExample && (
+          <>
+            <button
+              className="entity-drawer-backdrop"
+              type="button"
+              aria-label="Zamknij podgląd"
+              onClick={closeDrawer}
+            />
+            <aside className="entity-drawer" aria-label="Podgląd encji">
+              <div className="entity-drawer-header">
+                <div>
+                  <h2 className="h5 mb-1">Szczegóły encji</h2>
+                  <small className="text-secondary">
+                    {formatCreatedAt(selectedExample.created_at)}
+                  </small>
+                </div>
+                <div className="d-flex flex-wrap justify-content-end gap-2">
+                  <button
+                    className="btn btn-outline-secondary"
+                    type="button"
+                    title="Poprzednia (←)"
+                    disabled={drawerEditing || filteredExamples.length < 2}
+                    onClick={() => stepDrawer(-1)}
+                  >
+                    ← Poprzednia
+                  </button>
+                  <button
+                    className="btn btn-outline-secondary"
+                    type="button"
+                    title="Następna (→)"
+                    disabled={drawerEditing || filteredExamples.length < 2}
+                    onClick={() => stepDrawer(1)}
+                  >
+                    Następna →
+                  </button>
+                  {drawerEditing ? (
+                    <>
+                      <button
+                        className="btn btn-outline-primary"
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void saveDrawer(true)}
+                      >
+                        Zapisz jako kopię
+                      </button>
+                      <button
+                        className="btn btn-primary"
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void saveDrawer()}
+                      >
+                        Zapisz
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      onClick={() =>
+                        navigate(
+                          `/builder/${selectedExample.corpus_id ?? corpusId}?edit=${selectedExample.id}`,
+                        )
+                      }
+                    >
+                      Edytuj
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-outline-secondary"
+                    type="button"
+                    title="Zamknij"
+                    aria-label="Zamknij"
+                    onClick={closeDrawer}
+                  >
+                    <X size={17} />
+                  </button>
+                </div>
               </div>
-              <div className="d-flex flex-wrap justify-content-end gap-2">
+              {drawerError && (
+                <div className="alert alert-danger">{drawerError}</div>
+              )}
+              {exampleIssues.length > 0 && (
+                <section className="example-issues">
+                  <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
+                    <p className="panel-title mb-0">PROBLEMY Z ANALIZY</p>
+                    <div className="d-flex gap-2">
+                      <button
+                        className="btn btn-sm btn-outline-primary"
+                        type="button"
+                        disabled={drawerEditing}
+                        onClick={requestFix}
+                      >
+                        <Sparkles size={15} className="me-1" /> Napraw
+                      </button>
+                      <button
+                        className="btn btn-sm btn-outline-danger"
+                        type="button"
+                        title="Usuń przykład (do kosza)"
+                        aria-label="Usuń przykład"
+                        disabled={busy}
+                        onClick={() => void removeExample(selectedExample)}
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                  </div>
+                  <ul className="mb-0">
+                    {exampleIssues.map((issue, index) => (
+                      <li key={`${issue.check}-${index}`}>
+                        <strong>{issue.label}</strong>
+                        {issue.detail && (
+                          <span className="text-secondary">
+                            {" "}
+                            — {issue.detail}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  <textarea
+                    className="form-control form-control-sm mt-2"
+                    rows={2}
+                    value={fixNote}
+                    placeholder="Opcjonalnie: jak zmienić (np. skróć fragment do jednego punktu, dodaj klucz summary)…"
+                    aria-label="Wskazówki do naprawy"
+                    onChange={(event) => setFixNote(event.target.value)}
+                  />
+                </section>
+              )}
+              <div className="d-flex flex-wrap gap-2 mb-3">
                 <button
-                  className="btn btn-outline-secondary"
+                  className="btn btn-sm btn-outline-success"
                   type="button"
-                  title="Poprzednia (←)"
-                  disabled={drawerEditing || filteredExamples.length < 2}
-                  onClick={() => stepDrawer(-1)}
+                  disabled={busy || drawerEditing}
+                  onClick={() => void applyFlag("positive")}
                 >
-                  ← Poprzednia
+                  Oznacz ręcznie: positive
                 </button>
                 <button
-                  className="btn btn-outline-secondary"
+                  className="btn btn-sm btn-outline-danger"
                   type="button"
-                  title="Następna (→)"
-                  disabled={drawerEditing || filteredExamples.length < 2}
-                  onClick={() => stepDrawer(1)}
+                  disabled={busy || drawerEditing}
+                  onClick={() => void applyFlag("negative")}
                 >
-                  Następna →
+                  Oznacz ręcznie: negative
                 </button>
-                {drawerEditing ? (
-                  <>
+              </div>
+              <div className="entity-thread">
+                {drawerMessages.map((message, index) => (
+                  <article
+                    className={`chat-message ${message.role} ${editingMessageIndex === index ? "editing" : ""}`}
+                    key={`${message.role}-${index}`}
+                    onClick={() => {
+                      setDrawerEditing(true);
+                      setEditingMessageIndex(index);
+                    }}
+                  >
+                    <button
+                      className="chat-message-delete"
+                      type="button"
+                      title="Usuń wiadomość"
+                      aria-label="Usuń wiadomość"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        removeDrawerMessage(index);
+                      }}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                    {editingMessageIndex === index ? (
+                      <div className="entity-message-editor">
+                        <div className="d-flex justify-content-between gap-2 mb-2">
+                          <select
+                            className="form-select form-select-sm role-select"
+                            value={message.role}
+                            onChange={(event) =>
+                              updateDrawerMessage(index, {
+                                role: event.target.value as MessageRole,
+                              })
+                            }
+                          >
+                            <option value="system">system</option>
+                            <option value="user">user</option>
+                            <option value="assistant">assistant</option>
+                          </select>
+                          {message.role !== "system" && (
+                            <span className="d-flex gap-1">
+                              <button
+                                className="btn btn-sm message-move-button"
+                                type="button"
+                                title="Przenieś wyżej"
+                                aria-label="Przenieś wyżej"
+                                disabled={index === 0}
+                                onClick={() => moveDrawerMessage(index, -1)}
+                              >
+                                <ChevronUp size={15} />
+                              </button>
+                              <button
+                                className="btn btn-sm message-move-button"
+                                type="button"
+                                title="Przenieś niżej"
+                                aria-label="Przenieś niżej"
+                                disabled={index === drawerMessages.length - 1}
+                                onClick={() => moveDrawerMessage(index, 1)}
+                              >
+                                <ChevronDown size={15} />
+                              </button>
+                            </span>
+                          )}
+                        </div>
+                        <textarea
+                          className="form-control"
+                          spellCheck={false}
+                          rows={Math.max(
+                            4,
+                            message.content.split(/\r?\n/).length + 1,
+                          )}
+                          value={message.content}
+                          ref={(element) => {
+                            // Long single-line JSON wraps, so line count alone underestimates the height.
+                            if (!element) return;
+                            element.style.height = "auto";
+                            element.style.height = `${element.scrollHeight}px`;
+                          }}
+                          onInput={(event) => {
+                            event.currentTarget.style.height = "auto";
+                            event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`;
+                          }}
+                          onChange={(event) =>
+                            updateDrawerMessage(index, {
+                              content: event.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                    ) : (
+                      <>
+                        <strong>{message.role}</strong>
+                        <MessageContent content={message.content} />
+                      </>
+                    )}
+                  </article>
+                ))}
+              </div>
+              {drawerEditing && (
+                <>
+                  <button
+                    className="btn btn-outline-secondary mt-3"
+                    type="button"
+                    onClick={addDrawerMessage}
+                  >
+                    <Plus size={17} className="me-1" /> Dodaj wiadomość
+                  </button>
+                  <div className="entity-drawer-footer">
                     <button
                       className="btn btn-outline-primary"
                       type="button"
@@ -2286,312 +3885,122 @@ function CorporaPage({
                     >
                       Zapisz
                     </button>
-                  </>
-                ) : (
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    onClick={() =>
-                      navigate(
-                        `/builder/${selectedExample.corpus_id ?? corpusId}?edit=${selectedExample.id}`,
-                      )
-                    }
-                  >
-                    Edytuj
-                  </button>
-                )}
-                <button
-                  className="btn btn-outline-secondary"
-                  type="button"
-                  title="Zamknij"
-                  aria-label="Zamknij"
-                  onClick={closeDrawer}
-                >
-                  <X size={17} />
-                </button>
-              </div>
-            </div>
-            {drawerError && (
-              <div className="alert alert-danger">{drawerError}</div>
-            )}
-            <section className="review-panel">
-              <div className="d-flex flex-wrap align-items-center justify-content-between gap-2">
-                <div>
-                  <p className="panel-title mb-1">RECENZJA LOKALNEGO BIELIKA</p>
-                  <small className="text-secondary">
-                    Sugestia nie zmienia etykiety bez zatwierdzenia.
-                  </small>
-                </div>
-                <button
-                  className="btn btn-outline-primary"
-                  type="button"
-                  disabled={reviewing || drawerEditing}
-                  onClick={() => void reviewSelectedExample()}
-                >
-                  <Sparkles size={16} className="me-1" />{" "}
-                  {reviewing ? "Sprawdzanie..." : "Sprawdź"}
-                </button>
-              </div>
-              <div className="d-flex flex-wrap gap-2 mt-3">
-                <button
-                  className="btn btn-sm btn-outline-success"
-                  type="button"
-                  disabled={busy || drawerEditing}
-                  onClick={() => void applyReviewFlag("positive")}
-                >
-                  Oznacz ręcznie: positive
-                </button>
-                <button
-                  className="btn btn-sm btn-outline-danger"
-                  type="button"
-                  disabled={busy || drawerEditing}
-                  onClick={() => void applyReviewFlag("negative")}
-                >
-                  Oznacz ręcznie: negative
-                </button>
-              </div>
-              {review && (
-                <div className="review-result mt-3">
-                  <span
-                    className={`badge text-bg-${review.recommendation === "positive" ? "success" : review.recommendation === "negative" ? "danger" : "warning"}`}
-                  >
-                    {review.recommendation}
-                  </span>
-                  <span className="text-secondary small ms-2">
-                    pewność: {review.confidence}
-                  </span>
-                  <p className="mb-2 mt-2">{review.reason}</p>
-                  {review.recommendation !== "needs_review" && (
-                    <button
-                      className="btn btn-sm btn-primary"
-                      type="button"
-                      disabled={busy}
-                      onClick={() =>
-                        void applyReviewFlag(review.recommendation)
-                      }
-                    >
-                      Przyjmij: {review.recommendation}
-                    </button>
-                  )}
-                </div>
+                  </div>
+                </>
               )}
-            </section>
-            <div className="entity-thread">
-              {drawerMessages.map((message, index) => (
-                <article
-                  className={`chat-message ${message.role} ${editingMessageIndex === index ? "editing" : ""}`}
-                  key={`${message.role}-${index}`}
-                  onClick={() => {
-                    setDrawerEditing(true);
-                    setEditingMessageIndex(index);
-                  }}
-                >
-                  <button
-                    className="chat-message-delete"
-                    type="button"
-                    title="Usuń wiadomość"
-                    aria-label="Usuń wiadomość"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      removeDrawerMessage(index);
+            </aside>
+          </>
+        )}
+        {open && (
+          <div className="modal-backdrop show confirm-backdrop">
+            <div className="modal d-block" role="dialog">
+              <div className="modal-dialog">
+                <div className="modal-content">
+                  <div className="modal-header">
+                    <h2 className="h5 modal-title">Nowy korpus</h2>
+                  </div>
+                  <form
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      if (name.trim()) setConfirm(true);
                     }}
                   >
-                    <Trash2 size={15} />
-                  </button>
-                  {editingMessageIndex === index ? (
-                    <div className="entity-message-editor">
-                      <div className="d-flex justify-content-between gap-2 mb-2">
-                        <select
-                          className="form-select form-select-sm role-select"
-                          value={message.role}
-                          onChange={(event) =>
-                            updateDrawerMessage(index, {
-                              role: event.target.value as MessageRole,
-                            })
-                          }
-                        >
-                          <option value="system">system</option>
-                          <option value="user">user</option>
-                          <option value="assistant">assistant</option>
-                        </select>
-                        {message.role !== "system" && (
-                          <span className="d-flex gap-1">
-                            <button
-                              className="btn btn-sm message-move-button"
-                              type="button"
-                              title="Przenieś wyżej"
-                              aria-label="Przenieś wyżej"
-                              disabled={index === 0}
-                              onClick={() => moveDrawerMessage(index, -1)}
-                            >
-                              <ChevronUp size={15} />
-                            </button>
-                            <button
-                              className="btn btn-sm message-move-button"
-                              type="button"
-                              title="Przenieś niżej"
-                              aria-label="Przenieś niżej"
-                              disabled={index === drawerMessages.length - 1}
-                              onClick={() => moveDrawerMessage(index, 1)}
-                            >
-                              <ChevronDown size={15} />
-                            </button>
-                          </span>
-                        )}
-                      </div>
+                    <div className="modal-body">
+                      <label className="form-label" htmlFor="new-name">
+                        Nazwa
+                      </label>
+                      <input
+                        id="new-name"
+                        className="form-control mb-3"
+                        value={name}
+                        onChange={(event) => setName(event.target.value)}
+                        required
+                      />
+                      <label className="form-label" htmlFor="new-description">
+                        Opis
+                      </label>
                       <textarea
+                        id="new-description"
                         className="form-control"
-                        spellCheck={false}
-                        rows={Math.max(
-                          4,
-                          message.content.split(/\r?\n/).length + 1,
-                        )}
-                        value={message.content}
-                        onFocus={(event) => {
-                          event.currentTarget.style.height = "auto";
-                          event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`;
-                        }}
-                        onInput={(event) => {
-                          event.currentTarget.style.height = "auto";
-                          event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`;
-                        }}
-                        onChange={(event) =>
-                          updateDrawerMessage(index, {
-                            content: event.target.value,
-                          })
-                        }
+                        rows={3}
+                        value={description}
+                        onChange={(event) => setDescription(event.target.value)}
                       />
                     </div>
-                  ) : (
-                    <>
-                      <strong>{message.role}</strong>
-                      <MessageContent content={message.content} />
-                    </>
-                  )}
-                </article>
-              ))}
+                    <div className="modal-footer">
+                      <button
+                        className="btn btn-outline-secondary"
+                        type="button"
+                        onClick={() => {
+                          setOpen(false);
+                          navigate("/corpora");
+                        }}
+                      >
+                        Anuluj
+                      </button>
+                      <button className="btn btn-primary">Utwórz</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
             </div>
-            {drawerEditing && (
-              <>
-                <button
-                  className="btn btn-outline-secondary mt-3"
-                  type="button"
-                  onClick={addDrawerMessage}
-                >
-                  <Plus size={17} className="me-1" /> Dodaj wiadomość
-                </button>
-                <div className="entity-drawer-footer">
-                  <button
-                    className="btn btn-outline-primary"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void saveDrawer(true)}
-                  >
-                    Zapisz jako kopię
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void saveDrawer()}
-                  >
-                    Zapisz
-                  </button>
-                </div>
-              </>
-            )}
-          </aside>
-        </>
-      )}
-      {open && (
-        <div className="modal-backdrop show confirm-backdrop">
-          <div className="modal d-block" role="dialog">
-            <div className="modal-dialog">
-              <div className="modal-content">
-                <div className="modal-header">
-                  <h2 className="h5 modal-title">Nowy korpus</h2>
-                </div>
-                <form
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    if (name.trim()) setConfirm(true);
-                  }}
-                >
+          </div>
+        )}
+        {confirm && (
+          <div className="modal-backdrop show confirm-backdrop">
+            <div className="modal d-block" role="dialog">
+              <div className="modal-dialog">
+                <div className="modal-content">
+                  <div className="modal-header">
+                    <h2 className="h5 modal-title">Potwierdź utworzenie</h2>
+                  </div>
                   <div className="modal-body">
-                    <label className="form-label" htmlFor="new-name">
-                      Nazwa
-                    </label>
-                    <input
-                      id="new-name"
-                      className="form-control mb-3"
-                      value={name}
-                      onChange={(event) => setName(event.target.value)}
-                      required
-                    />
-                    <label className="form-label" htmlFor="new-description">
-                      Opis
-                    </label>
-                    <textarea
-                      id="new-description"
-                      className="form-control"
-                      rows={3}
-                      value={description}
-                      onChange={(event) => setDescription(event.target.value)}
-                    />
+                    <strong>{name}</strong>
                   </div>
                   <div className="modal-footer">
                     <button
                       className="btn btn-outline-secondary"
                       type="button"
-                      onClick={() => {
-                        setOpen(false);
-                        navigate("/corpora");
-                      }}
+                      onClick={() => setConfirm(false)}
                     >
-                      Anuluj
+                      Wróć
                     </button>
-                    <button className="btn btn-primary">Utwórz</button>
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void submit()}
+                    >
+                      Potwierdź
+                    </button>
                   </div>
-                </form>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-      {confirm && (
-        <div className="modal-backdrop show confirm-backdrop">
-          <div className="modal d-block" role="dialog">
-            <div className="modal-dialog">
-              <div className="modal-content">
-                <div className="modal-header">
-                  <h2 className="h5 modal-title">Potwierdź utworzenie</h2>
-                </div>
-                <div className="modal-body">
-                  <strong>{name}</strong>
-                </div>
-                <div className="modal-footer">
-                  <button
-                    className="btn btn-outline-secondary"
-                    type="button"
-                    onClick={() => setConfirm(false)}
-                  >
-                    Wróć
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void submit()}
-                  >
-                    Potwierdź
-                  </button>
                 </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
-    </MediumPageTemplate>
+        )}
+      </MediumPageTemplate>
+      <div
+        className="training-splitter corpora-splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Zmień szerokość panelu agenta"
+        title="Przeciągnij, aby zmienić szerokość; dwuklik przywraca domyślną"
+        onPointerDown={(event) =>
+          event.currentTarget.setPointerCapture(event.pointerId)
+        }
+        onPointerMove={resizeAgent}
+        onDoubleClick={() => {
+          setAgentWidth(null);
+          localStorage.removeItem("corpora-agent-width");
+        }}
+      />
+      <EntityAgentPanel
+        corpus={selectedCorpus}
+        onAdded={reloadExamples}
+        request={agentRequest}
+      />
+    </div>
   );
 }
 
@@ -2605,7 +4014,7 @@ function Builder({ corpora }: { corpora: Corpus[] }) {
     draft(),
   ]);
   const [output, setOutput] = useState("");
-  const [split, setSplit] = useState<Split>("train");
+  const [split, setSplit] = useState<ExampleSplit>("train");
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("");
   const [busy, setBusy] = useState(false);
@@ -3987,9 +5396,13 @@ function ExportSection({
   const [modelName, setModelName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const exports = exportsStatus?.exports ?? [];
+  const allExports = exportsStatus?.exports ?? [];
+  const exports = allExports.filter((entry) => entry.adapter_name === adapter);
   const stages = exportsStatus?.stages ?? [];
-  const running = exports.some((entry) => entry.state === "running");
+  const running = allExports.some((entry) => entry.state === "running");
+  const runningElsewhere = allExports.find(
+    (entry) => entry.state === "running" && entry.adapter_name !== adapter,
+  );
   const canExport = checkpoint && checkpoint !== "base";
   const run = async (action: () => Promise<ExportsStatus>) => {
     setBusy(true);
@@ -4076,6 +5489,17 @@ function ExportSection({
         </p>
       )}
       {error && <p className="text-danger small mt-2 mb-0">{error}</p>}
+      {runningElsewhere && (
+        <p className="text-secondary small mt-2 mb-0">
+          Trwa eksport innego adaptera ({runningElsewhere.adapter_name}/
+          {runningElsewhere.checkpoint}) — kolejny po jego zakończeniu.
+        </p>
+      )}
+      {exports.length === 0 && (
+        <p className="text-secondary small mt-2 mb-0">
+          Brak zmergowanych modeli dla adaptera {adapter}.
+        </p>
+      )}
       {exports.length > 0 && (
         <ul className="list-group list-group-flush mt-3">
           {exports.map((entry) => {
@@ -4108,7 +5532,20 @@ function ExportSection({
                       </>
                     )}
                     {entry.state === "failed" && (
-                      <span className="badge text-bg-danger">Błąd</span>
+                      <>
+                        <span className="badge text-bg-danger">Błąd</span>
+                        <button
+                          className="btn btn-sm btn-outline-primary"
+                          type="button"
+                          title="Wznów od etapu, który się nie udał"
+                          disabled={busy || running}
+                          onClick={() =>
+                            void run(() => api.retryExport(entry.id))
+                          }
+                        >
+                          Ponów od „{entry.stage}”
+                        </button>
+                      </>
                     )}
                     {entry.state !== "running" && (
                       <button
@@ -4181,6 +5618,7 @@ function ExportSection({
 
 function DeploymentPanel({
   adapters,
+  best,
   status,
   gpuBusy,
   onStatus,
@@ -4189,6 +5627,7 @@ function DeploymentPanel({
   onExports,
 }: {
   adapters: Record<string, string[]>;
+  best: Record<string, { checkpoint: string; eval_loss: number }>;
   status: ServingStatus | null;
   gpuBusy: boolean;
   onStatus: (status: ServingStatus) => void;
@@ -4205,10 +5644,13 @@ function DeploymentPanel({
   const checkpoints = (adapters[selectedAdapter] ?? []).filter(
     (item) => !item.startsWith("merged-"),
   );
+  const bestCheckpoint = best[selectedAdapter];
   const selectedCheckpoint =
     checkpoint && checkpoints.includes(checkpoint)
       ? checkpoint
-      : (checkpoints.find((item) => item !== "base") ?? "");
+      : bestCheckpoint && checkpoints.includes(bestCheckpoint.checkpoint)
+        ? bestCheckpoint.checkpoint
+        : (checkpoints.find((item) => item !== "base") ?? "");
   const active = status?.state === "ready" || status?.state === "loading";
   const isSelectedDeployed =
     active &&
@@ -4307,6 +5749,9 @@ function DeploymentPanel({
               {checkpoints.map((item) => (
                 <option key={item} value={item}>
                   {checkpointLabel(item)}
+                  {bestCheckpoint?.checkpoint === item
+                    ? ` ★ najlepszy (eval_loss ${bestCheckpoint.eval_loss.toFixed(4)})`
+                    : ""}
                   {active &&
                   status?.adapter_name === selectedAdapter &&
                   status?.checkpoint === item
@@ -4669,6 +6114,9 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
   const [exportsStatus, setExportsStatus] = useState<ExportsStatus | null>(
     null,
   );
+  const [bestCheckpoints, setBestCheckpoints] = useState<
+    Record<string, { checkpoint: string; eval_loss: number }>
+  >({});
   const refresh = () =>
     Promise.all([
       api.trainingStatus(corpusId),
@@ -4690,9 +6138,10 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
   useEffect(() => {
     // A finished export adds a "merged-…" checkpoint to the evaluation list.
     if (readyExports)
-      void api
-        .evaluationAdapters()
-        .then(({ adapters }) => setEvaluationAdapters(adapters));
+      void api.evaluationAdapters().then(({ adapters, best }) => {
+        setEvaluationAdapters(adapters);
+        setBestCheckpoints(best);
+      });
   }, [readyExports]);
 
   useEffect(() => {
@@ -4704,8 +6153,9 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
       setBaseModels(models);
       setBaseModel((current) => current || models[0] || "");
     });
-    void api.evaluationAdapters().then(({ adapters }) => {
+    void api.evaluationAdapters().then(({ adapters, best }) => {
       setEvaluationAdapters(adapters);
+      setBestCheckpoints(best);
       const firstAdapter = Object.keys(adapters)[0] || "";
       setEvaluationAdapter(firstAdapter);
       setEvaluationCheckpoints(adapters[firstAdapter]?.slice(0, 2) || []);
@@ -4717,11 +6167,27 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
     return () => window.clearInterval(interval);
   }, [corpusId]);
 
+  const [freedNotice, setFreedNotice] = useState("");
   const start = async () => {
     setBusy(true);
     setError("");
+    setFreedNotice("");
     try {
-      setStatus(await api.startTraining({ corpusId, baseModel, adapterName }));
+      const started = await api.startTraining({
+        corpusId,
+        baseModel,
+        adapterName,
+      });
+      setStatus(started);
+      const freed = [
+        ...(started.freed?.serving_stopped
+          ? ["zatrzymano wdrożony checkpoint"]
+          : []),
+        ...(started.freed?.ollama_unloaded.length
+          ? [`zwolniono z Ollamy: ${started.freed.ollama_unloaded.join(", ")}`]
+          : []),
+      ];
+      if (freed.length) setFreedNotice(`Zwolniono VRAM: ${freed.join("; ")}.`);
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -4881,6 +6347,7 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
         {evaluationOnly && (
           <DeploymentPanel
             adapters={evaluationAdapters}
+            best={bestCheckpoints}
             status={servingStatus}
             gpuBusy={isRunning || isEvaluationRunning}
             onStatus={setServingStatus}
@@ -4991,6 +6458,9 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
                 </button>
               </div>
               {error && <p className="text-danger small mt-3 mb-0">{error}</p>}
+              {freedNotice && (
+                <p className="text-secondary small mt-3 mb-0">{freedNotice}</p>
+              )}
               <h2 className="h5 mt-4">Profil QLoRA</h2>
               <code>{status?.profile ?? "profil QLoRA"}</code>
               <p className="text-secondary small mt-3 mb-0">
@@ -5378,11 +6848,21 @@ function Workspace() {
     pathname.startsWith(path),
   );
   const refresh = () => api.corpora().then(setCorpora);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem("corpus-sidebar-collapsed") === "1",
+  );
+  const toggleSidebar = () =>
+    setSidebarCollapsed((current) => {
+      localStorage.setItem("corpus-sidebar-collapsed", current ? "0" : "1");
+      return !current;
+    });
   useEffect(() => {
     void refresh();
   }, []);
   return (
-    <main className={`workspace-shell ${showSidebar ? "" : "no-sidebar"}`}>
+    <main
+      className={`workspace-shell ${showSidebar ? (sidebarCollapsed ? "sidebar-collapsed" : "") : "no-sidebar"}`}
+    >
       <header className="workspace-header">
         <Bot size={21} /> Bielik LoRA Lab{" "}
         <nav className="workspace-header-nav">
@@ -5398,10 +6878,56 @@ function Workspace() {
           <RefreshCw size={15} />
         </button>
       </header>
-      {showSidebar && (
+      {showSidebar && sidebarCollapsed && (
+        <aside className="corpus-sidebar collapsed">
+          <button
+            className="btn btn-sm btn-link corpus-rail-button"
+            type="button"
+            title="Rozwiń listę korpusów"
+            aria-label="Rozwiń listę korpusów"
+            onClick={toggleSidebar}
+          >
+            <PanelLeftOpen size={18} />
+          </button>
+          <NavLink
+            className="btn btn-sm btn-primary corpus-rail-button"
+            to="/corpora/new"
+            title="Nowy korpus"
+            aria-label="Nowy korpus"
+          >
+            <FilePlus2 size={16} />
+          </NavLink>
+          <nav>
+            {corpora.map((corpus) => (
+              <NavLink
+                className="corpus-rail-link"
+                key={corpus.id}
+                to={`/corpora/${corpus.id}`}
+                title={`${corpus.name} (${corpus.example_count})`}
+                aria-label={corpus.name}
+              >
+                {corpus.name
+                  .replace(/[^\p{L}\p{N}]/gu, "")
+                  .slice(0, 2)
+                  .toUpperCase()}
+              </NavLink>
+            ))}
+          </nav>
+        </aside>
+      )}
+      {showSidebar && !sidebarCollapsed && (
         <aside className="corpus-sidebar">
           <div className="sidebar-title">
             <Database size={16} /> KORPUSY
+            <button
+              className="btn btn-sm btn-link ms-auto p-0 text-secondary"
+              type="button"
+              title="Zwiń listę korpusów"
+              aria-label="Zwiń listę korpusów"
+              onClick={toggleSidebar}
+            >
+              <PanelLeftClose size={16} />
+            </button>
           </div>
           <NavLink className="btn btn-primary w-100 mb-3" to="/corpora/new">
             <FilePlus2 size={17} className="me-1" /> Nowy korpus

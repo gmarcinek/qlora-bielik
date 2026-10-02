@@ -7,5 +7,6 @@ COPY backend/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY src /app/src
 COPY backend /app/backend
+COPY prompts /app/prompts
 
 CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]

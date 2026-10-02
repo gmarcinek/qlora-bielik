@@ -26,3 +26,5 @@ models/
 # OS / editor
 .DS_Store
 Thumbs.db
+/prompts-priv
+

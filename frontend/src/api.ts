@@ -1,8 +1,20 @@
+export type SplitRatio = { train: number; validation: number; test: number };
+
+export type ExampleIssue = { check: string; label: string; detail: string };
+
+export type CorpusSettings = {
+  agent_prompt: string;
+  default_model: string | null;
+  split_ratio: SplitRatio;
+};
+
 export type Corpus = {
   id: string;
   name: string;
   description: string;
   example_count: number;
+  proposal_count?: number;
+  settings?: Partial<CorpusSettings>;
 };
 
 export type Example = {
@@ -10,12 +22,62 @@ export type Example = {
   corpus_id?: string;
   corpus_name?: string;
   created_at: string;
-  split: "train" | "validation" | "test";
+  split: "train" | "validation" | "test" | "unassigned";
   messages: Array<{ role: string; content: string }>;
-  metadata: { flag?: ExampleFlag; import_id?: string };
+  metadata: {
+    flag?: ExampleFlag | "proposal";
+    proposed_flag?: "positive" | "negative";
+    replaces?: string;
+    import_id?: string;
+  };
 };
 
 export type MessageRole = "system" | "user" | "assistant";
+
+type FlagCounts = Record<"positive" | "negative" | "unclassified", number>;
+
+export type AnalysisTypeRow = FlagCounts & {
+  type: string;
+  total: number;
+  train: number;
+  validation: number;
+  test: number;
+  negative_share: number | null;
+  warnings: string[];
+};
+
+export type CorpusAnalysisPart = {
+  examples: number;
+  answer_format: { json: boolean; common_keys: string[] };
+  splits: Record<string, FlagCounts>;
+  flags: FlagCounts;
+  types: AnalysisTypeRow[];
+  warnings: string[];
+  system_prompt: { with: number; without: number };
+  exchanges: Record<string, number>;
+  length_tokens: {
+    estimate_chars_per_token: number;
+    max_length: number | null;
+    median: number;
+    p95: number;
+    max: number;
+  };
+  issues: Record<
+    string,
+    {
+      label: string;
+      count: number;
+      examples: Array<{ id: string; detail: string }>;
+    }
+  >;
+};
+
+export type CorpusAnalysis = {
+  corpus: CorpusAnalysisPart;
+  proposals: CorpusAnalysisPart;
+  split_target?: SplitRatio;
+  unassigned?: number;
+};
 
 export type Message = {
   role: MessageRole;
@@ -27,7 +89,7 @@ export type ExampleFlag = "positive" | "negative" | "unclassified";
 type ExampleDraft = {
   split: string;
   messages: Message[];
-  flag: ExampleFlag;
+  flag: ExampleFlag | "proposal";
 };
 
 export type ImportedExample = {
@@ -121,6 +183,7 @@ export type TrainingHyperparameters = {
 
 export type TrainingStatus = {
   state: string;
+  freed?: { serving_stopped: boolean; ollama_unloaded: string[] };
   splits: Record<"train" | "validation" | "test", number>;
   profile: string;
   logs: string;
@@ -230,6 +293,59 @@ export type ServingStatus = {
 
 export type ExportQuantization = "Q4_K_M" | "Q5_K_M" | "Q6_K" | "Q8_0";
 
+export type AgentModel = {
+  id: string;
+  label: string;
+  provider: string;
+  available: boolean;
+};
+
+export type AgentEvent =
+  | { type: "text"; content: string }
+  | { type: "tool_call"; name: string; arguments: Record<string, unknown> }
+  | {
+      type: "tool_result";
+      name: string;
+      ok: boolean;
+      ms?: number;
+      error?: string;
+    }
+  | { type: "progress"; name: string; message: string }
+  | { type: "proposals"; saved: number; batch: string }
+  | {
+      type: "proposals_changed";
+      action: "update_proposals" | "reject_proposals";
+      count: number;
+    }
+  | { type: "examples_parked"; count: number }
+  | { type: "error"; message: string }
+  | { type: "done" };
+
+export type AgentAttachment = {
+  id: string;
+  name: string;
+  path: string;
+  bytes: number;
+  extension: string;
+  handling: "markitdown" | "text" | "binary";
+  converted?: string | null;
+  method?: string | null;
+  lines?: number;
+  chars?: number;
+  encoding?: string;
+  warnings?: string[];
+  error?: string;
+  read_with: string;
+};
+
+export type AgentSession = {
+  id: string;
+  created_at: number;
+  closed_at: number | null;
+  files: Array<{ path: string; bytes: number }>;
+  attachments: AgentAttachment[];
+};
+
 export type ExportEntry = {
   id: string;
   adapter_name: string;
@@ -261,12 +377,6 @@ export type BulkTransformResult = {
   revision_id: string | null;
 };
 
-export type ExampleReview = {
-  recommendation: "positive" | "negative" | "needs_review";
-  reason: string;
-  confidence: "high" | "medium" | "low";
-};
-
 export type ClassificationStatus = {
   state: "idle" | "running" | "completed" | "failed";
   total: number;
@@ -295,6 +405,22 @@ export const api = {
     }),
   examples: (corpusId: string) =>
     request<Example[]>(`/api/corpora/${corpusId}/examples`),
+  corpusAnalysis: (corpusId: string) =>
+    request<CorpusAnalysis>(`/api/corpora/${corpusId}/analysis`),
+  exampleIssues: (exampleId: string, messages?: Message[]) =>
+    request<ExampleIssue[]>(
+      `/api/examples/${exampleId}/issues`,
+      messages
+        ? { method: "POST", body: JSON.stringify({ messages }) }
+        : undefined,
+    ),
+  corpusSettings: (corpusId: string) =>
+    request<CorpusSettings>(`/api/corpora/${corpusId}/settings`),
+  updateCorpusSettings: (corpusId: string, settings: CorpusSettings) =>
+    request<CorpusSettings>(`/api/corpora/${corpusId}/settings`, {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
   allExamples: () => request<Example[]>("/api/examples"),
   createExample: (corpusId: string, example: ExampleDraft) =>
     request<Example>(`/api/corpora/${corpusId}/examples`, {
@@ -390,6 +516,14 @@ export const api = {
     request<{ reverted: number }>(`/api/revisions/${revisionId}/revert`, {
       method: "POST",
     }),
+  acceptProposals: (exampleIds: string[]) =>
+    request<{ accepted: number; replaced: number; trash_id: string | null }>(
+      "/api/examples/bulk/accept-proposals",
+      {
+        method: "POST",
+        body: JSON.stringify({ example_ids: exampleIds }),
+      },
+    ),
   bulkSetFlag: (exampleIds: string[], flag: ExampleFlag) =>
     request<{ updated: number }>("/api/examples/bulk/flag", {
       method: "POST",
@@ -397,7 +531,7 @@ export const api = {
     }),
   bulkSetSplit: (
     exampleIds: string[],
-    split: "train" | "validation" | "test",
+    split: "train" | "validation" | "test" | "unassigned",
   ) =>
     request<{ updated: number }>("/api/examples/bulk/split", {
       method: "POST",
@@ -444,10 +578,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ example_ids: exampleIds }),
     }),
-  reviewExample: (exampleId: string) =>
-    request<ExampleReview>(`/api/examples/${exampleId}/review`, {
-      method: "POST",
-    }),
   chat: (prompt: string) =>
     request<{ response: string }>("/api/chat", {
       method: "POST",
@@ -479,7 +609,10 @@ export const api = {
   stopTraining: () =>
     request<TrainingStatus>("/api/training/stop", { method: "POST" }),
   evaluationAdapters: () =>
-    request<{ adapters: Record<string, string[]> }>("/api/evaluation/adapters"),
+    request<{
+      adapters: Record<string, string[]>;
+      best: Record<string, { checkpoint: string; eval_loss: number }>;
+    }>("/api/evaluation/adapters"),
   evaluationStatus: () => request<EvaluationStatus>("/api/evaluation/status"),
   startEvaluation: (
     corpusId: string,
@@ -522,10 +655,89 @@ export const api = {
         model_name: modelName || null,
       }),
     }),
+  retryExport: (exportId: string) =>
+    request<ExportsStatus>(
+      `/api/exports/${encodeURIComponent(exportId)}/retry`,
+      { method: "POST" },
+    ),
   deleteExport: (exportId: string) =>
     request<ExportsStatus>(`/api/exports/${encodeURIComponent(exportId)}`, {
       method: "DELETE",
     }),
+  agentModels: () =>
+    request<{ models: AgentModel[]; default: string | null }>(
+      "/api/agent/models",
+    ),
+  agentSession: (sessionId: string) =>
+    request<AgentSession>(`/api/agent/sessions/${sessionId}`),
+  closeAgentSession: (sessionId: string) =>
+    request<AgentSession>(`/api/agent/sessions/${sessionId}/close`, {
+      method: "POST",
+    }),
+  uploadAgentFile: async (sessionId: string, file: File) => {
+    const response = await fetch(
+      `/api/agent/sessions/${sessionId}/files?name=${encodeURIComponent(file.name)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: file,
+      },
+    );
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(
+        typeof detail === "string"
+          ? detail
+          : `Nie udało się wgrać ${file.name}.`,
+      );
+    }
+    return (await response.json()) as AgentAttachment;
+  },
+  agentChat: async (
+    corpusId: string,
+    model: string,
+    messages: Array<{ role: "user" | "assistant"; content: string }>,
+    onEvent: (event: AgentEvent) => void,
+    signal?: AbortSignal,
+    conversationId?: string,
+  ) => {
+    const response = await fetch("/api/agent/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        corpus_id: corpusId,
+        model,
+        messages,
+        conversation_id: conversationId,
+      }),
+      signal,
+    });
+    if (!response.ok || !response.body) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(
+        typeof detail === "string" ? detail : "Nie udało się uruchomić agenta.",
+      );
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let remainder = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      remainder += decoder.decode(value, { stream: true });
+      const lines = remainder.split("\n");
+      remainder = lines.pop() ?? "";
+      lines
+        .filter(Boolean)
+        .forEach((line) => onEvent(JSON.parse(line) as AgentEvent));
+    }
+  },
   chatStream: async (
     messages: Message[],
     model: string,

@@ -48,19 +48,44 @@ services:
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
       TRAINING_HOST_ROOT: ${PWD}
       TRAINER_IMAGE: bielik-lab-trainer:local
+      SANDBOX_URL: http://sandbox:8080
+      SANDBOX_TOKEN: ${SANDBOX_TOKEN:-bielik-sandbox-local}
     depends_on:
       liquibase:
         condition: service_completed_successfully
+    networks: [default, sandbox]
     ports:
       - "8000:8000"
     volumes:
       - ./src:/app/src
       - ./backend:/app/backend
       - ./configs:/app/configs:ro
+      - ./prompts:/app/prompts:ro
       - ./data:/workspace/data
       - ./artifacts:/workspace/artifacts
       - /var/run/docker.sock:/var/run/docker.sock
     command: uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: docker/sandbox.Dockerfile
+    image: bielik-lab-sandbox:local
+    environment:
+      SANDBOX_TOKEN: ${SANDBOX_TOKEN:-bielik-sandbox-local}
+      SANDBOX_ROOT: /sessions
+      SHARED_ROOT: /shared
+      OCR_LANGUAGES: pol+eng
+    volumes:
+      - ./sandbox:/app/sandbox:ro
+      - ./artifacts/sandbox:/sessions
+      - ./data/shared:/shared:ro
+    # Bez dostępu do internetu; osiągalny tylko z api.
+    networks: [sandbox]
+    mem_limit: 6g
+    cpus: 4
+    pids_limit: 512
+    restart: unless-stopped
 
   frontend:
     build:
@@ -96,6 +121,11 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+networks:
+  default:
+  sandbox:
+    internal: true
 
 volumes:
   postgres-data:

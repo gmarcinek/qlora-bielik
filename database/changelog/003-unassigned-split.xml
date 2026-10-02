@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <changeSet id="003-unassigned-split" author="bielik-lab">
+        <comment>Split "unassigned": examples parked outside train/validation/test, kept for review.</comment>
+        <sql> ALTER TABLE training_examples DROP CONSTRAINT training_examples_split_check; ALTER
+            TABLE training_examples ADD CONSTRAINT training_examples_split_check CHECK (split IN
+            ('train', 'validation', 'test', 'unassigned')); </sql>
+        <rollback> UPDATE training_examples SET split = 'train' WHERE split = 'unassigned'; ALTER
+            TABLE training_examples DROP CONSTRAINT training_examples_split_check; ALTER TABLE
+            training_examples ADD CONSTRAINT training_examples_split_check CHECK (split IN ('train',
+            'validation', 'test')); </rollback>
+    </changeSet>
+</databaseChangeLog>
