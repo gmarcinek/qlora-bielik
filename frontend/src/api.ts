@@ -64,6 +64,47 @@ export type TrainingMetric = {
   entropy?: number;
   train_loss?: number;
   train_runtime?: number;
+  max_grad_norm?: number;
+  perplexity?: number;
+  eval_perplexity?: number;
+  generalization_gap?: number;
+  seconds_per_step?: number;
+  tokens_per_second?: number;
+  vram_peak_gb?: number;
+  vram_reserved_gb?: number;
+  gpu_util?: number;
+  gpu_temp?: number;
+  gpu_power?: number;
+  gpu_memory_used_gb?: number;
+  lora_a_norm?: number;
+  lora_b_norm?: number;
+  lora_grad_norm?: number;
+  // group_loss/flag:positive, group_loss/type:XYZ, ...
+  [key: string]: number | undefined;
+};
+
+export type DatasetSplitStats = {
+  count: number;
+  mean: number;
+  p50: number;
+  p90: number;
+  p99: number;
+  max: number;
+  truncated: number;
+  truncated_pct: number;
+  bin_width: number;
+  histogram: number[];
+};
+
+export type DatasetStats = {
+  max_length: number;
+  splits: Record<string, DatasetSplitStats>;
+  groups: Record<string, number>;
+};
+
+export type LoraLayerSnapshot = {
+  step: number;
+  layers: Array<{ layer: number; b_norm: number; grad_norm: number | null }>;
 };
 
 export type TrainingHyperparameters = {
@@ -88,6 +129,8 @@ export type TrainingStatus = {
   started_at?: string;
   finished_at?: string;
   metrics?: TrainingMetric[];
+  dataset_stats?: DatasetStats | null;
+  lora_layers?: LoraLayerSnapshot | null;
   hyperparameters?: TrainingHyperparameters | null;
   error?: string;
   adapter_ready: boolean;
@@ -183,6 +226,39 @@ export type ServingStatus = {
   logs?: string;
   error?: string | null;
   exit_code?: number | null;
+};
+
+export type ExportQuantization = "Q4_K_M" | "Q5_K_M" | "Q6_K" | "Q8_0";
+
+export type ExportEntry = {
+  id: string;
+  adapter_name: string;
+  checkpoint: string;
+  quantization: ExportQuantization;
+  model_name: string;
+  gguf: string;
+  state: "running" | "ready" | "failed";
+  stage: string;
+  stages: Record<string, { seconds: number }>;
+  started_at: number;
+  stage_started_at?: number;
+  finished_at?: number;
+  gguf_bytes?: number | null;
+  error?: string;
+  log_tail?: string;
+};
+
+export type ExportsStatus = {
+  exports: ExportEntry[];
+  stages: string[];
+  logs: string;
+};
+
+export type BulkTransformResult = {
+  matched: number;
+  skipped: Record<string, number>;
+  samples: Array<{ id: string; before: string; after: string }>;
+  revision_id: string | null;
 };
 
 export type ExampleReview = {
@@ -301,6 +377,19 @@ export const api = {
     request<{ restored: number }>(`/api/trash/${trashId}/restore`, {
       method: "POST",
     }),
+  bulkTransform: (exampleIds: string[], transform: string, dryRun: boolean) =>
+    request<BulkTransformResult>("/api/examples/bulk/transform", {
+      method: "POST",
+      body: JSON.stringify({
+        example_ids: exampleIds,
+        transform,
+        dry_run: dryRun,
+      }),
+    }),
+  revertRevision: (revisionId: string) =>
+    request<{ reverted: number }>(`/api/revisions/${revisionId}/revert`, {
+      method: "POST",
+    }),
   bulkSetFlag: (exampleIds: string[], flag: ExampleFlag) =>
     request<{ updated: number }>("/api/examples/bulk/flag", {
       method: "POST",
@@ -417,6 +506,26 @@ export const api = {
     }),
   stopServing: () =>
     request<ServingStatus>("/api/serving/stop", { method: "POST" }),
+  exports: () => request<ExportsStatus>("/api/exports"),
+  startExport: (
+    adapterName: string,
+    checkpoint: string,
+    quantization: ExportQuantization,
+    modelName: string,
+  ) =>
+    request<ExportsStatus>("/api/exports", {
+      method: "POST",
+      body: JSON.stringify({
+        adapter_name: adapterName,
+        checkpoint,
+        quantization,
+        model_name: modelName || null,
+      }),
+    }),
+  deleteExport: (exportId: string) =>
+    request<ExportsStatus>(`/api/exports/${encodeURIComponent(exportId)}`, {
+      method: "DELETE",
+    }),
   chatStream: async (
     messages: Message[],
     model: string,

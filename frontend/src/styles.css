@@ -62,11 +62,17 @@ body { min-width: 320px; background: #eef2ee; }
 .training-stats { display: grid; grid-template-columns: auto 1fr; gap: .2rem 1rem; font-size: .875rem; }
 .training-stats dt { font-weight: 400; color: #6c757d; }
 .training-stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.histogram { display: flex; align-items: flex-end; gap: 2px; height: 90px; border-bottom: 1px solid #d3ddd7; }
+.histogram-bar { flex: 1; min-height: 1px; background: #176b61; border-radius: 2px 2px 0 0; }
+.histogram-bar.over { background: #c0503a; }
+.group-loss-table { max-height: 240px; overflow-y: auto; }
+.group-loss-bar { height: .5rem; background: #d9822b; border-radius: 2px; }
 .metric-bar { display: grid; grid-template-columns: minmax(8rem, 14rem) 1fr 3.5rem; align-items: center; gap: .6rem; margin-bottom: .35rem; font-size: .8rem; }
 .metric-bar-label { overflow: hidden; color: #4f5b62; white-space: nowrap; text-overflow: ellipsis; }
 .metric-bar-track { height: .6rem; overflow: hidden; border-radius: 1rem; background: #e7ece9; }
 .metric-bar-fill { display: block; height: 100%; border-radius: 1rem; }
 .metric-bar-value { text-align: right; font-variant-numeric: tabular-nums; }
+.transform-sample { max-height: 18rem; margin: 0; padding: .5rem; overflow: auto; font-size: .75rem; white-space: pre-wrap; word-break: break-word; border-radius: .375rem; background: #f4f6f5; }
 .training-chart-swatch { display: inline-block; width: .75rem; height: .2rem; margin-right: .3rem; vertical-align: middle; border-radius: 1px; }.chat-history { min-height: 50vh; display: grid; align-content: start; gap: 1rem; }
 .chat-message { max-width: 85%; padding: .85rem 1rem; border-radius: .375rem; background: #edf2ef; }
 .chat-message.user { justify-self: end; color: #fff; background: #176b61; }
@@ -74,9 +80,15 @@ body { min-width: 320px; background: #eef2ee; }
 .chat-message.system { color: #fff; background: #333333; }
 .chat-message strong { display: block; margin-bottom: .25rem; font-size: .72rem; text-transform: uppercase; }
 .chat-message p { margin: 0; white-space: pre-wrap; }
+.chat-message p.json-content { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: .85rem; line-height: 1.5; color: #5c6b73; }
+.json-key { color: #0b5cad; }
+.json-string { color: #1a7f37; }
+.json-number { color: #b35900; }
+.json-literal { color: #8250df; font-weight: 600; }
 .entity-list-item { align-items: start; }
 .bulk-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: .75rem 1rem; border: 1px solid #d3ddd7; border-radius: .375rem; background: #f7f9f6; }
 .bulk-split-control { width: 15rem; }
+.random-split-control { width: 19rem; }
 .automatic-classification { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .75rem; padding: .75rem 1rem; border: 1px solid #b9d5c7; border-radius: .375rem; background: #e8f3ec; }
 .advanced-filters { padding: .65rem .85rem; border: 1px solid #d3ddd7; border-radius: .375rem; background: #f7f9f6; }
 .advanced-filters summary { cursor: pointer; color: #43534d; font-size: .85rem; font-weight: 700; }

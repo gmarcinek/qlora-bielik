@@ -44,16 +44,21 @@ import {
   Example,
   ExampleFlag,
   ExampleReview,
+  BulkTransformResult,
   EvaluationSummary,
   EvaluationCheckpointResult,
   EvaluationCurvePoint,
   EvaluationStatus,
   ServingStatus,
+  ExportsStatus,
+  ExportQuantization,
   ImportedExample,
   Message,
   MessageRole,
   ParaphraseProviderCatalog,
   TrainingMetric,
+  DatasetStats,
+  LoraLayerSnapshot,
   TrainingStatus,
   TrainingRunSummary,
 } from "./api";
@@ -150,25 +155,28 @@ function isOwuAnnotationDto(records: Record<string, unknown>[]): boolean {
   );
 }
 
-function isCorpusDto(records: Record<string, unknown>[]): boolean {
-  return records.every((record) => {
+function corpusDtoProblem(records: Record<string, unknown>[]): string | null {
+  for (const [index, record] of records.entries()) {
+    const line = `Rekord ${index + 1}`;
     const messages = record.messages;
-    return (
-      Array.isArray(messages) &&
-      messages.length >= 2 &&
-      messages.every(
-        (message) =>
-          message &&
-          typeof message === "object" &&
-          ["system", "user", "assistant"].includes(
-            (message as Record<string, unknown>).role as string,
-          ) &&
-          typeof (message as Record<string, unknown>).content === "string" &&
-          Boolean((message as Record<string, unknown>).content),
-      ) &&
-      (messages.at(-1) as Record<string, unknown>).role === "assistant"
-    );
-  });
+    if (!Array.isArray(messages)) return `${line}: brak tablicy messages.`;
+    if (messages.length < 2)
+      return `${line}: messages ma mniej niż 2 wiadomości.`;
+    for (const [position, message] of messages.entries()) {
+      const item = (message ?? {}) as Record<string, unknown>;
+      if (!["system", "user", "assistant"].includes(item.role as string))
+        return `${line}, wiadomość ${position + 1}: nieobsługiwana rola „${String(item.role)}”.`;
+      if (typeof item.content !== "string" || !item.content)
+        return `${line}, wiadomość ${position + 1} (${String(item.role)}): pusta lub nie-tekstowa treść.`;
+    }
+    if ((messages.at(-1) as Record<string, unknown>).role !== "assistant")
+      return `${line}: ostatnia wiadomość nie jest od assistant.`;
+  }
+  return null;
+}
+
+function isCorpusDto(records: Record<string, unknown>[]): boolean {
+  return corpusDtoProblem(records) === null;
 }
 
 function mapImportRecord(
@@ -253,6 +261,114 @@ function mapOwuAnnotationRecord(
   };
 }
 
+function autoMapRecords(
+  records: Record<string, unknown>[],
+): { examples: ImportedExample[]; skipped: string[] } | null {
+  const owu = isOwuAnnotationDto(records);
+  const keys = [...new Set(records.flatMap((record) => Object.keys(record)))];
+  const detected = detectImportMapping(keys);
+  if (!owu && !detected.messages && !(detected.user && detected.assistant))
+    return null;
+  // split/flag are applied separately so a bad value doesn't drop the record
+  const mapping = { ...detected, split: "", flag: "" };
+  const examples: ImportedExample[] = [];
+  const skipped: string[] = [];
+  records.forEach((record, index) => {
+    try {
+      const mapped = owu
+        ? mapOwuAnnotationRecord(record, index)
+        : mapImportRecord(record, mapping, index);
+      const messages = mapped.messages
+        .filter(
+          (message) =>
+            message &&
+            ["system", "user", "assistant"].includes(message.role) &&
+            typeof message.content === "string" &&
+            message.content.trim(),
+        )
+        .map((message) => ({ role: message.role, content: message.content }));
+      if (messages.length < 2 || messages.at(-1)?.role !== "assistant") {
+        skipped.push(`rekord ${index + 1}: brak pary pytanie–odpowiedź`);
+        return;
+      }
+      const split = detected.split ? record[detected.split] : undefined;
+      const flag = detected.flag ? record[detected.flag] : undefined;
+      examples.push({
+        ...mapped,
+        messages,
+        ...(typeof split === "string" &&
+        ["train", "validation", "test"].includes(split)
+          ? { split: split as Split }
+          : {}),
+        ...(typeof flag === "string" &&
+        ["positive", "negative", "unclassified"].includes(flag)
+          ? { flag: flag as ExampleFlag }
+          : {}),
+      });
+    } catch (error) {
+      skipped.push(
+        `rekord ${index + 1}: ${error instanceof Error ? error.message : "błąd"}`,
+      );
+    }
+  });
+  return examples.length ? { examples, skipped } : null;
+}
+
+type TransformName = "wrap_entities_summary" | "pretty_json" | "compact_json";
+
+const TRANSFORM_LABELS: Record<
+  TransformName,
+  { title: string; description: string }
+> = {
+  wrap_entities_summary: {
+    title: "Tekst + JSON → {entities, summary}",
+    description:
+      "Tekst przed pierwszym obiektem JSON trafia do summary, obiekty JSON do listy entities.",
+  },
+  pretty_json: {
+    title: "JSON → pretty (wcięcia)",
+    description:
+      "Odpowiedzi będące czystym JSON-em są formatowane z wcięciem 2 spacji; treść i kolejność kluczy bez zmian.",
+  },
+  compact_json: {
+    title: "JSON → kompaktowy (jedna linia)",
+    description:
+      "Odpowiedzi będące czystym JSON-em są zapisywane w jednej linii bez zbędnych spacji (mniej tokenów przy uczeniu).",
+  },
+};
+
+const JSON_TOKEN =
+  /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
+
+function MessageContent({ content }: { content: string }) {
+  if (!/^\s*[{[]/.test(content)) return <p>{content}</p>;
+  const parts: ReactNode[] = [];
+  let last = 0;
+  for (const match of content.matchAll(JSON_TOKEN)) {
+    const start = match.index ?? 0;
+    if (start > last) parts.push(content.slice(last, start));
+    const [token, string, colon, literal, number] = match;
+    const className = string
+      ? colon
+        ? "json-key"
+        : "json-string"
+      : literal
+        ? "json-literal"
+        : number
+          ? "json-number"
+          : "";
+    parts.push(
+      <span className={className} key={start}>
+        {string ?? token}
+      </span>,
+    );
+    if (colon) parts.push(colon);
+    last = start + token.length;
+  }
+  parts.push(content.slice(last));
+  return <p className="json-content">{parts}</p>;
+}
+
 function CorporaPage({
   corpora,
   onCreated,
@@ -293,6 +409,7 @@ function CorporaPage({
   const [importFilter, setImportFilter] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkSplit, setBulkSplit] = useState<Split>("train");
+  const [validationPercent, setValidationPercent] = useState(10);
   const [exportSplit, setExportSplit] = useState<Split>("train");
   const [importSplit, setImportSplit] = useState<Split>("train");
   const [activeView, setActiveView] = useState<"list" | "duplicates">("list");
@@ -326,6 +443,83 @@ function CorporaPage({
     }
   }
   const [importError, setImportError] = useState("");
+  const [transformPreview, setTransformPreview] =
+    useState<BulkTransformResult | null>(null);
+  const [transformIds, setTransformIds] = useState<string[]>([]);
+  const [transformName, setTransformName] = useState<TransformName>(
+    "wrap_entities_summary",
+  );
+  const [lastRevision, setLastRevision] = useState<{
+    revisionId: string;
+    count: number;
+  } | null>(null);
+  const reloadExamples = async () =>
+    setExamples(await (corpusId ? api.examples(corpusId) : api.allExamples()));
+  async function previewTransform(
+    name: TransformName = transformName,
+    exampleIds: string[] = [...selectedIds],
+  ) {
+    setBusy(true);
+    setImportError("");
+    try {
+      setTransformName(name);
+      setTransformPreview(await api.bulkTransform(exampleIds, name, true));
+      setTransformIds(exampleIds);
+    } catch (error) {
+      setImportError(
+        error instanceof Error
+          ? error.message
+          : "Nie udało się przygotować podglądu.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function applyTransform() {
+    setBusy(true);
+    setImportError("");
+    try {
+      const result = await api.bulkTransform(
+        transformIds,
+        transformName,
+        false,
+      );
+      setTransformPreview(null);
+      setSelectedIds(new Set());
+      await reloadExamples();
+      if (result.revision_id)
+        setLastRevision({
+          revisionId: result.revision_id,
+          count: result.matched,
+        });
+    } catch (error) {
+      setImportError(
+        error instanceof Error
+          ? error.message
+          : "Nie udało się przekształcić odpowiedzi.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function revertTransform() {
+    if (!lastRevision) return;
+    setBusy(true);
+    try {
+      const result = await api.revertRevision(lastRevision.revisionId);
+      await reloadExamples();
+      setLastRevision(null);
+      setImportNotice(
+        `Przywrócono poprzednią treść odpowiedzi: ${result.reverted}.`,
+      );
+    } catch (error) {
+      setImportError(
+        error instanceof Error ? error.message : "Nie udało się cofnąć zmian.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
   const [importSession, setImportSession] = useState<ImportSession | null>(
     null,
   );
@@ -472,6 +666,11 @@ function CorporaPage({
         await saveImportedExamples(records as ImportedExample[]);
         return;
       }
+      const automatic = autoMapRecords(records);
+      if (automatic) {
+        await saveImportedExamples(automatic.examples, automatic.skipped);
+        return;
+      }
       const keys = [
         ...new Set(records.flatMap((record) => Object.keys(record))),
       ];
@@ -491,7 +690,10 @@ function CorporaPage({
       setBusy(false);
     }
   }
-  async function saveImportedExamples(examples: ImportedExample[]) {
+  async function saveImportedExamples(
+    examples: ImportedExample[],
+    skipped: string[] = [],
+  ) {
     if (!selectedCorpus) return;
     const result = await api.importExamples(
       selectedCorpus.id,
@@ -502,10 +704,13 @@ function CorporaPage({
     );
     setExamples(await api.examples(selectedCorpus.id));
     onCorpusUpdated();
-    setFlagFilter("unclassified");
+    setFlagFilter("");
     setImportFilter(result.import_id);
     setImportNotice(
-      `Zaimportowano encje: ${result.imported}. Domyślny split: ${importSplit}. Partia: ${result.import_id}. Następne zadanie: klasyfikacja positive/negative.`,
+      `Zaimportowano encje: ${result.imported}. Domyślny split: ${importSplit}. Partia: ${result.import_id}.` +
+        (skipped.length
+          ? ` Pominięto ${skipped.length}: ${skipped.slice(0, 3).join("; ")}${skipped.length > 3 ? "; …" : ""}.`
+          : ""),
     );
   }
   function openManualPromptVariant(
@@ -849,24 +1054,6 @@ function CorporaPage({
       return next;
     });
   }
-  async function applyBulkFlag(flag: ExampleFlag) {
-    if (!selectedIds.size) return;
-    setBusy(true);
-    try {
-      const exampleIds = [...selectedIds];
-      await api.bulkSetFlag(exampleIds, flag);
-      setExamples((current) =>
-        current.map((example) =>
-          exampleIds.includes(example.id)
-            ? { ...example, metadata: { ...example.metadata, flag } }
-            : example,
-        ),
-      );
-      setSelectedIds(new Set());
-    } finally {
-      setBusy(false);
-    }
-  }
   async function applyBulkSplit() {
     if (!selectedIds.size) return;
     setBusy(true);
@@ -885,25 +1072,56 @@ function CorporaPage({
       setBusy(false);
     }
   }
-  async function classifySelected() {
-    if (!selectedIds.size) return;
+  async function randomSplitSelected() {
+    // Stratified by flag so validation keeps the positive/negative ratio.
+    const groups = new Map<string, string[]>();
+    examples
+      .filter((example) => selectedIds.has(example.id))
+      .forEach((example) => {
+        const flag = example.metadata.flag ?? "unclassified";
+        groups.set(flag, [...(groups.get(flag) ?? []), example.id]);
+      });
+    const validationIds: string[] = [];
+    const trainIds: string[] = [];
+    const breakdown: string[] = [];
+    groups.forEach((ids, flag) => {
+      for (let index = ids.length - 1; index > 0; index -= 1) {
+        const other = Math.floor(Math.random() * (index + 1));
+        [ids[index], ids[other]] = [ids[other], ids[index]];
+      }
+      const count = Math.round((ids.length * validationPercent) / 100);
+      validationIds.push(...ids.slice(0, count));
+      trainIds.push(...ids.slice(count));
+      breakdown.push(
+        `${flag}: ${ids.length - count} train / ${count} validation`,
+      );
+    });
+    const total = validationIds.length + trainIds.length;
+    if (
+      !validationIds.length ||
+      !window.confirm(
+        `Losowo podzielić ${total} zaznaczonych (${validationPercent}% do walidacji z każdej flagi):\n\n${breakdown.join("\n")}\n\nRazem: ${trainIds.length} train, ${validationIds.length} validation.`,
+      )
+    )
+      return;
     setBusy(true);
-    setImportError("");
     try {
-      const result = await api.bulkClassify([...selectedIds]);
-      const refreshed = corpusId
-        ? await api.examples(corpusId)
-        : await api.allExamples();
-      setExamples(refreshed);
+      await api.bulkSetSplit(validationIds, "validation");
+      if (trainIds.length) await api.bulkSetSplit(trainIds, "train");
+      const validationSet = new Set(validationIds);
+      setExamples((current) =>
+        current.map((example) =>
+          selectedIds.has(example.id)
+            ? {
+                ...example,
+                split: validationSet.has(example.id) ? "validation" : "train",
+              }
+            : example,
+        ),
+      );
       setSelectedIds(new Set());
       setImportNotice(
-        `Sklasyfikowano: ${result.classified}. Do ręcznej oceny: ${result.needs_review}.`,
-      );
-    } catch (error) {
-      setImportError(
-        error instanceof Error
-          ? error.message
-          : "Nie udało się sklasyfikować encji.",
+        `Podzielono losowo: ${trainIds.length} train, ${validationIds.length} validation.`,
       );
     } finally {
       setBusy(false);
@@ -993,6 +1211,26 @@ function CorporaPage({
   const automaticCandidates = filteredExamples.filter(
     (example) => example.metadata.flag === "unclassified",
   );
+  function stepDrawer(offset: number) {
+    if (!selectedExample || drawerEditing || filteredExamples.length < 2)
+      return;
+    const index = filteredExamples.findIndex(
+      (example) => example.id === selectedExample.id,
+    );
+    const count = filteredExamples.length;
+    openDrawer(filteredExamples[(index + offset + count) % count]);
+  }
+  useEffect(() => {
+    if (!selectedExample) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, [contenteditable]")) return;
+      if (event.key === "ArrowLeft") stepDrawer(-1);
+      else if (event.key === "ArrowRight") stepDrawer(1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
   const systemPromptGroups = (() => {
     const groups = new Map<string, Example[]>();
     examples.forEach((example) => {
@@ -1087,6 +1325,28 @@ function CorporaPage({
         </div>
       }
     >
+      {lastRevision && (
+        <div className="alert alert-info d-flex justify-content-between align-items-center gap-2">
+          <span>Przekształcono odpowiedzi: {lastRevision.count}.</span>
+          <span className="d-flex gap-2">
+            <button
+              className="btn btn-sm btn-info"
+              type="button"
+              disabled={busy}
+              onClick={() => void revertTransform()}
+            >
+              Cofnij
+            </button>
+            <button
+              className="btn btn-sm btn-outline-secondary"
+              type="button"
+              onClick={() => setLastRevision(null)}
+            >
+              <X size={14} />
+            </button>
+          </span>
+        </div>
+      )}
       {lastDeletion && (
         <div className="alert alert-warning d-flex justify-content-between align-items-center gap-2">
           <span>Usunięto encje: {lastDeletion.count}.</span>
@@ -1271,51 +1531,52 @@ function CorporaPage({
                   Ustaw split
                 </button>
               </div>
+              <div className="input-group input-group-sm random-split-control">
+                <span className="input-group-text">Walidacja</span>
+                <input
+                  className="form-control"
+                  type="number"
+                  min={1}
+                  max={99}
+                  value={validationPercent}
+                  disabled={busy}
+                  onChange={(event) =>
+                    setValidationPercent(
+                      Math.min(
+                        99,
+                        Math.max(1, Number(event.target.value) || 1),
+                      ),
+                    )
+                  }
+                  aria-label="Procent do walidacji"
+                />
+                <span className="input-group-text">%</span>
+                <button
+                  className="btn btn-outline-primary"
+                  type="button"
+                  disabled={busy || selectedIds.size < 2}
+                  onClick={() => void randomSplitSelected()}
+                  title="Losowo przypisz zaznaczone do train/validation"
+                >
+                  Losowy podział
+                </button>
+              </div>
               <button
-                className="btn btn-sm btn-primary"
-                type="button"
-                disabled={busy || selectedIds.size > 100}
-                onClick={() => void classifySelected()}
-              >
-                <Sparkles size={15} className="me-1" /> Klasyfikuj Bielikiem
-              </button>
-              <button
-                className="btn btn-sm btn-outline-secondary"
+                className="btn btn-sm btn-outline-primary"
                 type="button"
                 disabled={busy}
-                onClick={() => void applyBulkFlag("unclassified")}
+                onClick={() => void previewTransform()}
               >
-                Do klasyfikacji
+                Transformacje
               </button>
               <button
-                className="btn btn-sm btn-outline-success"
-                type="button"
-                disabled={busy}
-                onClick={() => void applyBulkFlag("positive")}
-              >
-                Oznacz positive
-              </button>
-              <button
-                className="btn btn-sm btn-outline-danger"
-                type="button"
-                disabled={busy}
-                onClick={() => void applyBulkFlag("negative")}
-              >
-                Oznacz negative
-              </button>
-              <button
-                className="btn btn-sm btn-danger"
+                className="btn btn-sm btn-danger ms-auto"
                 type="button"
                 disabled={busy}
                 onClick={() => void deleteSelected()}
               >
                 <Trash2 size={15} className="me-1" /> Usuń
               </button>
-              {selectedIds.size > 100 && (
-                <small className="text-danger">
-                  Maksymalnie 100 encji w jednym zadaniu klasyfikacji.
-                </small>
-              )}
             </div>
           )}
           {examplesLoading ? (
@@ -1479,6 +1740,84 @@ function CorporaPage({
           )}
         </section>
       )}
+      {transformPreview && (
+        <div className="modal-backdrop show confirm-backdrop">
+          <div className="modal d-block" role="dialog" aria-modal="true">
+            <div className="modal-dialog modal-xl">
+              <div className="modal-content">
+                <div className="modal-header">
+                  <h2 className="h5 modal-title">Transformacje</h2>
+                </div>
+                <div className="modal-body">
+                  <select
+                    className="form-select mb-2"
+                    value={transformName}
+                    disabled={busy}
+                    onChange={(event) =>
+                      void previewTransform(
+                        event.target.value as TransformName,
+                        transformIds,
+                      )
+                    }
+                    aria-label="Rodzaj przekształcenia"
+                  >
+                    {Object.entries(TRANSFORM_LABELS).map(([name, label]) => (
+                      <option key={name} value={name}>
+                        {label.title}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-secondary small">
+                    {TRANSFORM_LABELS[transformName].description} Dotyczy tylko
+                    odpowiedzi asystenta; zmiana jest zapisywana z kopią
+                    oryginałów i można ją cofnąć.
+                  </p>
+                  <p className="mb-1">
+                    Do zmiany: <strong>{transformPreview.matched}</strong> z{" "}
+                    {transformIds.length}
+                  </p>
+                  {Object.entries(transformPreview.skipped).map(
+                    ([reason, count]) => (
+                      <div className="small text-secondary" key={reason}>
+                        Pominięte ({reason}): {count}
+                      </div>
+                    ),
+                  )}
+                  {transformPreview.samples.map((sample) => (
+                    <div className="row g-2 mt-2" key={sample.id}>
+                      <div className="col-12 col-lg-6">
+                        <div className="small text-secondary">Przed</div>
+                        <pre className="transform-sample">{sample.before}</pre>
+                      </div>
+                      <div className="col-12 col-lg-6">
+                        <div className="small text-secondary">Po</div>
+                        <pre className="transform-sample">{sample.after}</pre>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="modal-footer">
+                  <button
+                    className="btn btn-outline-secondary"
+                    type="button"
+                    onClick={() => setTransformPreview(null)}
+                  >
+                    Anuluj
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    disabled={busy || !transformPreview.matched}
+                    onClick={() => void applyTransform()}
+                  >
+                    Zastosuj do {transformPreview.matched}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {importSession && (
         <div className="modal-backdrop show confirm-backdrop">
           <div className="modal d-block" role="dialog" aria-modal="true">
@@ -1492,6 +1831,13 @@ function CorporaPage({
                     Wykryto rekordy:{" "}
                     <strong>{importSession.records.length}</strong>
                   </p>
+                  {importSession.adapter === "mapping" &&
+                    corpusDtoProblem(importSession.records) && (
+                      <div className="alert alert-warning small">
+                        Plik nie został rozpoznany jako gotowy format korpusu:{" "}
+                        {corpusDtoProblem(importSession.records)}
+                      </div>
+                    )}
                   <p className="text-secondary small">
                     {importSession.adapter === "owu-annotations"
                       ? "Wykryto DTO OWU annotations. Importer zbuduje wiadomości z task, labels, text i target."
@@ -1907,17 +2253,20 @@ function CorporaPage({
                 <button
                   className="btn btn-outline-secondary"
                   type="button"
+                  title="Poprzednia (←)"
                   disabled={drawerEditing || filteredExamples.length < 2}
-                  onClick={() => {
-                    const index = filteredExamples.findIndex(
-                      (example) => example.id === selectedExample.id,
-                    );
-                    openDrawer(
-                      filteredExamples[(index + 1) % filteredExamples.length],
-                    );
-                  }}
+                  onClick={() => stepDrawer(-1)}
                 >
-                  Następna
+                  ← Poprzednia
+                </button>
+                <button
+                  className="btn btn-outline-secondary"
+                  type="button"
+                  title="Następna (→)"
+                  disabled={drawerEditing || filteredExamples.length < 2}
+                  onClick={() => stepDrawer(1)}
+                >
+                  Następna →
                 </button>
                 {drawerEditing ? (
                   <>
@@ -2116,7 +2465,7 @@ function CorporaPage({
                   ) : (
                     <>
                       <strong>{message.role}</strong>
-                      <p>{message.content}</p>
+                      <MessageContent content={message.content} />
                     </>
                   )}
                 </article>
@@ -2626,7 +2975,7 @@ function Chat() {
           {history.map((message, index) => (
             <article className={`chat-message ${message.role}`} key={index}>
               <strong>{message.role}</strong>
-              <p>{message.content}</p>
+              <MessageContent content={message.content} />
             </article>
           ))}
         </div>
@@ -2838,19 +3187,255 @@ function LineChart({
   );
 }
 
-function metricSeries(
-  metrics: TrainingMetric[],
-  key:
-    | "loss"
-    | "eval_loss"
-    | "learning_rate"
-    | "mean_token_accuracy"
-    | "entropy"
-    | "grad_norm",
-) {
+function metricSeries(metrics: TrainingMetric[], key: string) {
   return metrics
     .filter((metric) => typeof metric[key] === "number")
     .map((metric) => ({ x: metric.step, y: metric[key] as number }));
+}
+
+function lastMetric(metrics: TrainingMetric[], key: string) {
+  return [...metrics]
+    .reverse()
+    .find((metric) => typeof metric[key] === "number")?.[key];
+}
+
+function maxMetric(metrics: TrainingMetric[], key: string) {
+  const values = metricSeries(metrics, key).map((point) => point.y);
+  return values.length ? Math.max(...values) : undefined;
+}
+
+const GROUP_COLORS = ["#176b61", "#c0503a", "#3d6fb6", "#d9822b", "#8e5bb5"];
+
+function DatasetStatsPanel({ stats }: { stats: DatasetStats }) {
+  return (
+    <div className="card shadow-sm border-0 mt-3">
+      <div className="card-body">
+        <h3 className="h6">
+          Jakość danych · długość przykładów w tokenach (max_length{" "}
+          {stats.max_length})
+        </h3>
+        <div className="row g-4">
+          {Object.entries(stats.splits).map(([split, item]) => (
+            <div className="col-12 col-lg-6" key={split}>
+              <div className="d-flex justify-content-between align-items-baseline">
+                <strong>{split}</strong>
+                <span
+                  className={
+                    item.truncated ? "text-danger small" : "text-success small"
+                  }
+                >
+                  Ucięte: {item.truncated} ({item.truncated_pct}%)
+                </span>
+              </div>
+              <div className="small text-secondary mb-2">
+                {item.count} przykładów · średnio {item.mean} · p50 {item.p50} ·
+                p90 {item.p90} · p99 {item.p99} · max {item.max}
+              </div>
+              <div className="histogram">
+                {item.histogram.map((count, index) => {
+                  const from = index * item.bin_width;
+                  const peak = Math.max(...item.histogram, 1);
+                  return (
+                    <div
+                      key={index}
+                      className={`histogram-bar ${from >= stats.max_length ? "over" : ""}`}
+                      style={{ height: `${(count / peak) * 100}%` }}
+                      title={`${from}–${from + item.bin_width} tokenów: ${count}`}
+                    />
+                  );
+                })}
+              </div>
+              <div className="d-flex justify-content-between small text-secondary">
+                <span>0</span>
+                <span>{item.histogram.length * item.bin_width}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        {Object.values(stats.splits).some((item) => item.truncated) && (
+          <p className="small text-danger mb-0 mt-2">
+            Czerwone słupki przekraczają max_length — końcówki tych odpowiedzi
+            są ucinane, więc model uczy się niedokończonego JSON-a. Rozważ
+            większy max_length albo kompaktowy JSON.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function GroupLossPanel({
+  metrics,
+  counts,
+}: {
+  metrics: TrainingMetric[];
+  counts: Record<string, number>;
+}) {
+  const keys = [
+    ...new Set(
+      metrics.flatMap((metric) =>
+        Object.keys(metric).filter((key) => key.startsWith("group_loss/")),
+      ),
+    ),
+  ];
+  if (!keys.length) return null;
+  const flagKeys = keys.filter((key) => key.startsWith("group_loss/flag:"));
+  const typeRows = keys
+    .filter((key) => key.startsWith("group_loss/type:"))
+    .map((key) => {
+      const points = metricSeries(metrics, key);
+      const group = key.slice("group_loss/".length);
+      return {
+        name: group.slice("type:".length),
+        count: counts[group],
+        first: points[0]?.y,
+        last: points.at(-1)?.y ?? 0,
+      };
+    })
+    .sort((left, right) => right.last - left.last);
+  const worst = Math.max(...typeRows.map((row) => row.last), 1e-9);
+  return (
+    <div className="card shadow-sm border-0 mt-3">
+      <div className="card-body">
+        <div className="row g-4">
+          <div className="col-12 col-lg-6">
+            <LineChart
+              title="Eval loss wg flagi"
+              width={480}
+              height={200}
+              format={(value) => value.toFixed(3)}
+              series={flagKeys.map((key, index) => ({
+                label: `${key.slice("group_loss/flag:".length)} (${counts[key.slice("group_loss/".length)] ?? "?"})`,
+                color: GROUP_COLORS[index % GROUP_COLORS.length],
+                points: metricSeries(metrics, key),
+              }))}
+            />
+          </div>
+          <div className="col-12 col-lg-6">
+            <h3 className="h6 mb-1">
+              Eval loss wg typu encji (ostatnia ewaluacja)
+            </h3>
+            <div className="group-loss-table">
+              <table className="table table-sm small mb-0">
+                <thead>
+                  <tr>
+                    <th>Typ</th>
+                    <th className="text-end">Przykłady</th>
+                    <th className="text-end">Loss</th>
+                    <th className="text-end">Zmiana</th>
+                    <th style={{ width: "30%" }} />
+                  </tr>
+                </thead>
+                <tbody>
+                  {typeRows.map((row) => (
+                    <tr key={row.name}>
+                      <td className="text-break">{row.name}</td>
+                      <td className="text-end">{row.count ?? "-"}</td>
+                      <td className="text-end">{row.last.toFixed(3)}</td>
+                      <td
+                        className={`text-end ${row.first !== undefined && row.last > row.first ? "text-danger" : "text-success"}`}
+                      >
+                        {row.first !== undefined
+                          ? (row.last - row.first).toFixed(3)
+                          : "-"}
+                      </td>
+                      <td>
+                        <div
+                          className="group-loss-bar"
+                          style={{ width: `${(row.last / worst) * 100}%` }}
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoraLayersPanel({
+  snapshot,
+  clipped,
+  steps,
+  maxGradNorm,
+}: {
+  snapshot: LoraLayerSnapshot | null | undefined;
+  clipped: number;
+  steps: number;
+  maxGradNorm: number;
+}) {
+  const columns: Array<{
+    title: string;
+    key: "b_norm" | "grad_norm";
+    color: string;
+  }> = [
+    { title: "Norma wag LoRA B per warstwa", key: "b_norm", color: "#3d6fb6" },
+    {
+      title: "Norma gradientu LoRA per warstwa",
+      key: "grad_norm",
+      color: "#c0503a",
+    },
+  ];
+  return (
+    <div className="card shadow-sm border-0 mt-3">
+      <div className="card-body">
+        <div className="d-flex justify-content-between align-items-baseline">
+          <h3 className="h6">
+            Diagnostyka LoRA{snapshot ? ` · krok ${snapshot.step}` : ""}
+          </h3>
+          <span
+            className={`small ${clipped ? "text-warning" : "text-secondary"}`}
+          >
+            Przycinanie gradientu (grad_norm &gt; {maxGradNorm}): {clipped} /{" "}
+            {steps} kroków
+            {steps ? ` (${((clipped / steps) * 100).toFixed(0)}%)` : ""}
+          </span>
+        </div>
+        {snapshot?.layers.length ? (
+          <div className="row g-4">
+            {columns.map((column) => {
+              const values = snapshot.layers.map(
+                (layer) => layer[column.key] ?? 0,
+              );
+              const peak = Math.max(...values, 1e-12);
+              return (
+                <div className="col-12 col-lg-6" key={column.key}>
+                  <div className="small text-secondary mb-1">
+                    {column.title}
+                  </div>
+                  <div className="histogram">
+                    {snapshot.layers.map((layer, index) => (
+                      <div
+                        key={layer.layer}
+                        className="histogram-bar"
+                        style={{
+                          height: `${(values[index] / peak) * 100}%`,
+                          background: column.color,
+                        }}
+                        title={`warstwa ${layer.layer}: ${values[index].toExponential(2)}`}
+                      />
+                    ))}
+                  </div>
+                  <div className="d-flex justify-content-between small text-secondary">
+                    <span>warstwa {snapshot.layers[0].layer}</span>
+                    <span>warstwa {snapshot.layers.at(-1)?.layer}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="text-secondary small mb-0">
+            Brak danych per warstwa — pojawią się w kolejnym treningu.
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
@@ -2862,35 +3447,197 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
   const learningRatePoints = metricSeries(metrics, "learning_rate");
   const smallCharts: Array<{
     title: string;
-    color: string;
-    points: Array<{ x: number; y: number }>;
     format: (value: number) => string;
+    series: ChartSeries[];
   }> = [
     {
       title: "Learning rate",
-      color: "#3d6fb6",
-      points: learningRatePoints,
       format: (value) => value.toExponential(1),
+      series: [{ label: "lr", color: "#3d6fb6", points: learningRatePoints }],
     },
     {
       title: "Mean token accuracy",
-      color: "#176b61",
-      points: metricSeries(metrics, "mean_token_accuracy"),
       format: (value) => `${(value * 100).toFixed(1)}%`,
+      series: [
+        {
+          label: "train",
+          color: "#176b61",
+          points: metricSeries(metrics, "mean_token_accuracy"),
+        },
+        {
+          label: "eval",
+          color: "#d9822b",
+          points: metricSeries(metrics, "eval_mean_token_accuracy"),
+        },
+      ],
+    },
+    {
+      title: "Perplexity = exp(loss)",
+      format: (value) => value.toFixed(3),
+      series: [
+        {
+          label: "train",
+          color: "#176b61",
+          points: metricSeries(metrics, "perplexity"),
+        },
+        {
+          label: "eval",
+          color: "#d9822b",
+          points: metricSeries(metrics, "eval_perplexity"),
+        },
+      ],
+    },
+    {
+      title: "Przeuczenie: eval_loss − średni train loss",
+      format: (value) => value.toFixed(3),
+      series: [
+        {
+          label: "różnica",
+          color: "#c0503a",
+          points: metricSeries(metrics, "generalization_gap"),
+        },
+      ],
     },
     {
       title: "Entropy",
-      color: "#8e5bb5",
-      points: metricSeries(metrics, "entropy"),
       format: (value) => value.toFixed(3),
+      series: [
+        {
+          label: "entropy",
+          color: "#8e5bb5",
+          points: metricSeries(metrics, "entropy"),
+        },
+      ],
     },
     {
-      title: "Grad norm",
-      color: "#c0503a",
-      points: metricSeries(metrics, "grad_norm"),
+      title: "Grad norm (przed przycięciem)",
       format: (value) => value.toFixed(3),
+      series: [
+        {
+          label: "grad_norm",
+          color: "#c0503a",
+          points: metricSeries(metrics, "grad_norm"),
+        },
+      ],
+    },
+    {
+      title: "Tokeny / s",
+      format: (value) => value.toFixed(0),
+      series: [
+        {
+          label: "tokeny/s",
+          color: "#176b61",
+          points: metricSeries(metrics, "tokens_per_second"),
+        },
+      ],
+    },
+    {
+      title: "Sekundy / krok",
+      format: (value) => value.toFixed(1),
+      series: [
+        {
+          label: "s/krok",
+          color: "#3d6fb6",
+          points: metricSeries(metrics, "seconds_per_step"),
+        },
+      ],
+    },
+    {
+      title: "VRAM (GiB)",
+      format: (value) => value.toFixed(2),
+      series: [
+        {
+          label: "szczyt alokacji",
+          color: "#c0503a",
+          points: metricSeries(metrics, "vram_peak_gb"),
+        },
+        {
+          label: "zarezerwowane",
+          color: "#8e5bb5",
+          points: metricSeries(metrics, "vram_reserved_gb"),
+        },
+        {
+          label: "nvidia-smi",
+          color: "#6c757d",
+          points: metricSeries(metrics, "gpu_memory_used_gb"),
+        },
+      ],
+    },
+    {
+      title: "GPU obciążenie (%)",
+      format: (value) => value.toFixed(0),
+      series: [
+        {
+          label: "util",
+          color: "#176b61",
+          points: metricSeries(metrics, "gpu_util"),
+        },
+      ],
+    },
+    {
+      title: "GPU temperatura (°C)",
+      format: (value) => value.toFixed(0),
+      series: [
+        {
+          label: "temp",
+          color: "#d9822b",
+          points: metricSeries(metrics, "gpu_temp"),
+        },
+      ],
+    },
+    {
+      title: "GPU pobór mocy (W)",
+      format: (value) => value.toFixed(0),
+      series: [
+        {
+          label: "moc",
+          color: "#c0503a",
+          points: metricSeries(metrics, "gpu_power"),
+        },
+      ],
+    },
+    {
+      title: "LoRA: norma wag adapterów",
+      format: (value) => value.toFixed(3),
+      series: [
+        {
+          label: "A",
+          color: "#8e5bb5",
+          points: metricSeries(metrics, "lora_a_norm"),
+        },
+        {
+          label: "B",
+          color: "#3d6fb6",
+          points: metricSeries(metrics, "lora_b_norm"),
+        },
+      ],
+    },
+    {
+      title: "LoRA: norma gradientu (po przycięciu)",
+      format: (value) => value.toFixed(3),
+      series: [
+        {
+          label: "grad",
+          color: "#c0503a",
+          points: metricSeries(metrics, "lora_grad_norm"),
+        },
+      ],
     },
   ];
+  const maxGradNorm =
+    metrics.find((metric) => typeof metric.max_grad_norm === "number")
+      ?.max_grad_norm ?? 1;
+  const gradNormPoints = metricSeries(metrics, "grad_norm");
+  const clippedSteps = gradNormPoints.filter(
+    (point) => point.y > maxGradNorm,
+  ).length;
+  const gapPoints = metricSeries(metrics, "generalization_gap");
+  const lastGap = gapPoints.at(-1)?.y;
+  const gapRising =
+    lastGap !== undefined &&
+    gapPoints.length > 1 &&
+    lastGap > 0 &&
+    lastGap > gapPoints[gapPoints.length - 2].y + 0.01;
   const step = last?.step ?? 0;
   const maxSteps = last?.max_steps ?? 0;
   const progress = maxSteps ? Math.min(100, (step / maxSteps) * 100) : 0;
@@ -3021,6 +3768,66 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
             </div>
           </div>
         </div>
+        <div className="col-12 col-md-6">
+          <div className="card shadow-sm border-0 h-100">
+            <div className="card-body">
+              <p className="text-secondary mb-1">Perplexity (train / eval)</p>
+              <div className="display-6">
+                {formatMetric(lastMetric(metrics, "perplexity"), 3)}
+                <span className="fs-4 text-secondary">
+                  {" / "}
+                  {formatMetric(lastMetric(metrics, "eval_perplexity"), 3)}
+                </span>
+              </div>
+              <dl className="training-stats mt-2 mb-0">
+                <dt>Eval − train loss</dt>
+                <dd className={gapRising ? "text-danger" : ""}>
+                  {formatMetric(lastGap)}
+                  {gapRising && " ↑ rośnie — możliwe przeuczenie"}
+                </dd>
+                <dt>Eval accuracy</dt>
+                <dd>
+                  {lastMetric(metrics, "eval_mean_token_accuracy") !== undefined
+                    ? `${((lastMetric(metrics, "eval_mean_token_accuracy") ?? 0) * 100).toFixed(1)}%`
+                    : "-"}
+                </dd>
+                <dt>Przycięte gradienty</dt>
+                <dd>
+                  {gradNormPoints.length
+                    ? `${clippedSteps} / ${gradNormPoints.length} (limit ${maxGradNorm})`
+                    : "-"}
+                </dd>
+              </dl>
+            </div>
+          </div>
+        </div>
+        <div className="col-12 col-md-6">
+          <div className="card shadow-sm border-0 h-100">
+            <div className="card-body">
+              <p className="text-secondary mb-1">Wydajność i GPU</p>
+              <div className="display-6">
+                {formatMetric(lastMetric(metrics, "tokens_per_second"), 0)}
+                <span className="fs-4 text-secondary"> tok/s</span>
+              </div>
+              <dl className="training-stats mt-2 mb-0">
+                <dt>VRAM szczyt (ostatni / max)</dt>
+                <dd>
+                  {formatMetric(lastMetric(metrics, "vram_peak_gb"), 2)} /{" "}
+                  {formatMetric(maxMetric(metrics, "vram_peak_gb"), 2)} GiB
+                </dd>
+                <dt>GPU obciążenie</dt>
+                <dd>{formatMetric(lastMetric(metrics, "gpu_util"), 0)} %</dd>
+                <dt>Temperatura (max)</dt>
+                <dd>
+                  {formatMetric(lastMetric(metrics, "gpu_temp"), 0)} °C (
+                  {formatMetric(maxMetric(metrics, "gpu_temp"), 0)} °C)
+                </dd>
+                <dt>Pobór mocy</dt>
+                <dd>{formatMetric(lastMetric(metrics, "gpu_power"), 0)} W</dd>
+              </dl>
+            </div>
+          </div>
+        </div>
       </div>
       <div className="card shadow-sm border-0 mt-4">
         <div className="card-body">
@@ -3046,19 +3853,28 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
                   width={480}
                   height={160}
                   format={chart.format}
-                  series={[
-                    {
-                      label: chart.title,
-                      color: chart.color,
-                      points: chart.points,
-                    },
-                  ]}
+                  series={chart.series}
                 />
               </div>
             ))}
           </div>
         </div>
       </div>
+      {status?.dataset_stats && (
+        <DatasetStatsPanel stats={status.dataset_stats} />
+      )}
+      <GroupLossPanel
+        metrics={metrics}
+        counts={status?.dataset_stats?.groups ?? {}}
+      />
+      {metrics.length > 0 && (
+        <LoraLayersPanel
+          snapshot={status?.lora_layers}
+          clipped={clippedSteps}
+          steps={gradNormPoints.length}
+          maxGradNorm={maxGradNorm}
+        />
+      )}
     </>
   );
 }
@@ -3140,7 +3956,227 @@ function TrainingLogView({ logs }: { logs: string }) {
 }
 
 function checkpointLabel(checkpoint: string) {
+  if (checkpoint.startsWith("merged-"))
+    return `${checkpoint.slice("merged-".length)} · zmergowany (Ollama)`;
   return checkpoint === "base" ? "base (bez adaptera)" : checkpoint;
+}
+
+const EXPORT_STAGE_LABELS: Record<string, string> = {
+  merge: "wtapianie adaptera w model bazowy",
+  convert: "konwersja do GGUF (f16)",
+  quantize: "kwantyzacja",
+  cleanup: "usuwanie plików pośrednich",
+  register: "rejestracja w Ollamie",
+};
+
+function ExportSection({
+  adapter,
+  checkpoint,
+  exportsStatus,
+  trainingRunning,
+  onExports,
+}: {
+  adapter: string;
+  checkpoint: string;
+  exportsStatus: ExportsStatus | null;
+  trainingRunning: boolean;
+  onExports: (status: ExportsStatus) => void;
+}) {
+  const [quantization, setQuantization] =
+    useState<ExportQuantization>("Q4_K_M");
+  const [modelName, setModelName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const exports = exportsStatus?.exports ?? [];
+  const stages = exportsStatus?.stages ?? [];
+  const running = exports.some((entry) => entry.state === "running");
+  const canExport = checkpoint && checkpoint !== "base";
+  const run = async (action: () => Promise<ExportsStatus>) => {
+    setBusy(true);
+    setError("");
+    try {
+      onExports(await action());
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : String(requestError),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const now = Date.now() / 1000;
+  return (
+    <div className="border-top mt-3 pt-3">
+      <h3 className="h6 mb-1">Zmergowany model w Ollamie (szybki)</h3>
+      <p className="text-secondary small mb-2">
+        Adapter jest wtapiany w model bazowy, konwertowany do GGUF, kwantyzowany
+        i rejestrowany w Ollamie. Taki model od razu jest w czacie i można go
+        ewaluować jako „zmergowany” — generuje wielokrotnie szybciej niż
+        adapter. Eksport działa na CPU (~25 GB RAM) i trwa
+        kilkanaście–kilkadziesiąt minut.
+      </p>
+      <div className="row g-2 align-items-end">
+        <div className="col-12 col-md-3">
+          <label className="form-label small mb-1" htmlFor="export-quant">
+            Kwantyzacja
+          </label>
+          <select
+            id="export-quant"
+            className="form-select"
+            value={quantization}
+            onChange={(event) =>
+              setQuantization(event.target.value as ExportQuantization)
+            }
+          >
+            <option value="Q4_K_M">Q4_K_M (~6.7 GB, zalecana)</option>
+            <option value="Q5_K_M">Q5_K_M (~7.9 GB)</option>
+            <option value="Q6_K">Q6_K (~9.1 GB)</option>
+            <option value="Q8_0">Q8_0 (~11.8 GB)</option>
+          </select>
+        </div>
+        <div className="col-12 col-md-5">
+          <label className="form-label small mb-1" htmlFor="export-name">
+            Nazwa w Ollamie
+          </label>
+          <input
+            id="export-name"
+            className="form-control"
+            value={modelName}
+            placeholder={`${adapter}-${checkpoint}`}
+            onChange={(event) =>
+              setModelName(event.target.value.replace(/[^A-Za-z0-9._-]/g, "-"))
+            }
+          />
+        </div>
+        <div className="col-12 col-md-4">
+          <button
+            className="btn btn-outline-primary w-100"
+            type="button"
+            disabled={busy || running || trainingRunning || !canExport}
+            onClick={() =>
+              void run(() =>
+                api.startExport(adapter, checkpoint, quantization, modelName),
+              )
+            }
+          >
+            Zmerguj i wyślij do Ollamy
+          </button>
+        </div>
+      </div>
+      {!canExport && (
+        <p className="text-secondary small mt-2 mb-0">
+          Wybierz checkpoint (nie „base”), aby go zmergować.
+        </p>
+      )}
+      {trainingRunning && (
+        <p className="text-secondary small mt-2 mb-0">
+          Eksport będzie możliwy po zakończeniu treningu.
+        </p>
+      )}
+      {error && <p className="text-danger small mt-2 mb-0">{error}</p>}
+      {exports.length > 0 && (
+        <ul className="list-group list-group-flush mt-3">
+          {exports.map((entry) => {
+            const stageIndex = stages.indexOf(entry.stage);
+            return (
+              <li className="list-group-item px-0" key={entry.id}>
+                <div className="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                  <div>
+                    <code>{entry.model_name}</code>{" "}
+                    <span className="text-secondary small">
+                      {entry.adapter_name}/{entry.checkpoint} ·{" "}
+                      {entry.quantization}
+                      {entry.gguf_bytes
+                        ? ` · ${(entry.gguf_bytes / 2 ** 30).toFixed(2)} GiB`
+                        : ""}
+                    </span>
+                  </div>
+                  <div className="d-flex align-items-center gap-2">
+                    {entry.state === "running" && (
+                      <span className="badge text-bg-info">
+                        Etap {stageIndex + 1}/{stages.length}
+                      </span>
+                    )}
+                    {entry.state === "ready" && (
+                      <>
+                        <span className="badge text-bg-success">W Ollamie</span>
+                        <NavLink className="small" to="/chat">
+                          czat
+                        </NavLink>
+                      </>
+                    )}
+                    {entry.state === "failed" && (
+                      <span className="badge text-bg-danger">Błąd</span>
+                    )}
+                    {entry.state !== "running" && (
+                      <button
+                        className="btn btn-sm btn-outline-danger"
+                        type="button"
+                        title="Usuń z Ollamy i z dysku"
+                        disabled={busy}
+                        onClick={() => {
+                          if (
+                            window.confirm(
+                              `Usunąć ${entry.model_name} z Ollamy i plik GGUF z dysku?`,
+                            )
+                          )
+                            void run(() => api.deleteExport(entry.id));
+                        }}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {entry.state === "running" && (
+                  <>
+                    <div className="progress my-2" style={{ height: 6 }}>
+                      <div
+                        className="progress-bar progress-bar-striped progress-bar-animated"
+                        style={{
+                          width: `${((stageIndex + 0.5) / Math.max(stages.length, 1)) * 100}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="small text-secondary">
+                      {EXPORT_STAGE_LABELS[entry.stage] ?? entry.stage}
+                      {entry.stage_started_at
+                        ? ` · ${formatDuration(now - entry.stage_started_at)}`
+                        : ""}
+                      {" · łącznie "}
+                      {formatDuration(now - entry.started_at)}
+                    </div>
+                  </>
+                )}
+                {entry.state === "ready" &&
+                  Object.keys(entry.stages).length > 0 && (
+                    <div className="small text-secondary">
+                      {stages
+                        .filter((stage) => entry.stages[stage])
+                        .map(
+                          (stage) =>
+                            `${stage} ${formatDuration(entry.stages[stage].seconds)}`,
+                        )
+                        .join(" · ")}
+                    </div>
+                  )}
+                {entry.state === "failed" && (
+                  <details className="small mt-1">
+                    <summary className="text-danger">{entry.error}</summary>
+                    <pre className="transform-sample mt-1">
+                      {entry.log_tail}
+                    </pre>
+                  </details>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function DeploymentPanel({
@@ -3148,11 +4184,17 @@ function DeploymentPanel({
   status,
   gpuBusy,
   onStatus,
+  exportsStatus,
+  trainingRunning,
+  onExports,
 }: {
   adapters: Record<string, string[]>;
   status: ServingStatus | null;
   gpuBusy: boolean;
   onStatus: (status: ServingStatus) => void;
+  exportsStatus: ExportsStatus | null;
+  trainingRunning: boolean;
+  onExports: (status: ExportsStatus) => void;
 }) {
   const [adapter, setAdapter] = useState("");
   const [checkpoint, setCheckpoint] = useState("");
@@ -3160,7 +4202,9 @@ function DeploymentPanel({
   const [error, setError] = useState("");
   const adapterNames = Object.keys(adapters);
   const selectedAdapter = adapter || adapterNames[0] || "";
-  const checkpoints = adapters[selectedAdapter] ?? [];
+  const checkpoints = (adapters[selectedAdapter] ?? []).filter(
+    (item) => !item.startsWith("merged-"),
+  );
   const selectedCheckpoint =
     checkpoint && checkpoints.includes(checkpoint)
       ? checkpoint
@@ -3307,6 +4351,13 @@ function DeploymentPanel({
           </p>
         )}
         {error && <p className="text-danger small mt-2 mb-0">{error}</p>}
+        <ExportSection
+          adapter={selectedAdapter}
+          checkpoint={selectedCheckpoint}
+          exportsStatus={exportsStatus}
+          trainingRunning={trainingRunning}
+          onExports={onExports}
+        />
       </div>
     </div>
   );
@@ -3615,18 +4666,34 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
   const [servingStatus, setServingStatus] = useState<ServingStatus | null>(
     null,
   );
+  const [exportsStatus, setExportsStatus] = useState<ExportsStatus | null>(
+    null,
+  );
   const refresh = () =>
     Promise.all([
       api.trainingStatus(corpusId),
       api.evaluationStatus(),
       api.servingStatus(),
+      evaluationOnly ? api.exports() : Promise.resolve(null),
     ])
-      .then(([training, evaluation, serving]) => {
+      .then(([training, evaluation, serving, exportsResult]) => {
         setStatus(training);
         setEvaluationStatus(evaluation);
         setServingStatus(serving);
+        if (exportsResult) setExportsStatus(exportsResult);
       })
       .catch((requestError: Error) => setError(requestError.message));
+  const readyExports = (exportsStatus?.exports ?? [])
+    .filter((entry) => entry.state === "ready")
+    .map((entry) => entry.id)
+    .join(",");
+  useEffect(() => {
+    // A finished export adds a "merged-…" checkpoint to the evaluation list.
+    if (readyExports)
+      void api
+        .evaluationAdapters()
+        .then(({ adapters }) => setEvaluationAdapters(adapters));
+  }, [readyExports]);
 
   useEffect(() => {
     void api.corpora().then((items) => {
@@ -3817,6 +4884,9 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
             status={servingStatus}
             gpuBusy={isRunning || isEvaluationRunning}
             onStatus={setServingStatus}
+            exportsStatus={exportsStatus}
+            trainingRunning={isRunning}
+            onExports={setExportsStatus}
           />
         )}
         {!evaluationOnly && (
@@ -4284,10 +5354,15 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
           logs={
             (evaluationOnly
               ? !isEvaluationRunning &&
-                servingStatus &&
-                ["loading", "ready", "failed"].includes(servingStatus.state)
-                ? servingStatus.logs
-                : evaluationStatus?.logs
+                exportsStatus?.exports.some(
+                  (entry) => entry.state === "running",
+                )
+                ? exportsStatus.logs
+                : !isEvaluationRunning &&
+                    servingStatus &&
+                    ["loading", "ready", "failed"].includes(servingStatus.state)
+                  ? servingStatus.logs
+                  : evaluationStatus?.logs
               : (viewedRun ?? status)?.logs) || "Brak logów zadania."
           }
         />

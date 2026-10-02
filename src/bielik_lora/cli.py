@@ -48,6 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
     comparison.add_argument("--data", type=Path, required=True)
     comparison.add_argument("--output", type=Path, required=True)
     comparison.add_argument("--max-new-tokens", type=int, default=2048)
+    comparison.add_argument(
+        "--ollama-model",
+        action="append",
+        default=[],
+        metavar="CHECKPOINT=MODEL",
+        help="Evaluate this checkpoint id through a merged model served by Ollama",
+    )
+    register = commands.add_parser("ollama-register", help="Upload a GGUF to Ollama and create a ChatML model")
+    register.add_argument("--gguf", type=Path, required=True)
+    register.add_argument("--name", required=True)
     serving = commands.add_parser("serve-adapter", help="Serve chat completions from a LoRA checkpoint")
     serving.add_argument("--base-model", required=True)
     serving.add_argument("--adapter", type=Path)
@@ -95,7 +105,12 @@ def main() -> None:
             arguments.data,
             arguments.output,
             arguments.max_new_tokens,
+            dict(item.split("=", 1) for item in arguments.ollama_model),
         )
+    elif arguments.command == "ollama-register":
+        from bielik_lora.ollama_export import register
+
+        register(arguments.gguf, arguments.name)
     elif arguments.command == "serve-adapter":
         from bielik_lora.serving import serve
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import shlex
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -22,6 +24,7 @@ from psycopg_pool import ConnectionPool
 import yaml
 
 from bielik_lora.evaluation import BASE_CHECKPOINT, precision_recall_f1, score_example, summarize
+from bielik_lora.transforms import transform_messages
 from bielik_lora.ollama import chat as ollama_chat
 from bielik_lora.ollama import chat_stream, list_models
 from bielik_lora.ollama import generate
@@ -103,6 +106,13 @@ class EvaluationStart(BaseModel):
     splits: list[Literal["train", "validation", "test"]] = Field(min_length=1)
 
 
+class ExportStart(BaseModel):
+    adapter_name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
+    checkpoint: str = Field(pattern=r"^(final|checkpoint-\d+)$")
+    quantization: Literal["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"] = "Q4_K_M"
+    model_name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{1,80}$")
+
+
 class BulkExamples(BaseModel):
     example_ids: list[UUID] = Field(min_length=1, max_length=10000)
 
@@ -113,6 +123,11 @@ class BulkFlag(BulkExamples):
 
 class BulkSplit(BulkExamples):
     split: Literal["train", "validation", "test"]
+
+
+class BulkTransform(BulkExamples):
+    transform: Literal["wrap_entities_summary", "pretty_json", "compact_json"]
+    dry_run: bool = True
 
 
 class BulkSystemPrompt(BulkExamples):
@@ -160,7 +175,19 @@ async def lifespan(app: FastAPI):
     )
     pool.open(wait=True)
     app.state.pool = pool
+    stop_exports = threading.Event()
+
+    def export_loop() -> None:
+        # Advances the export pipeline even when nobody polls the UI.
+        while not stop_exports.wait(10):
+            try:
+                advance_exports()
+            except Exception as loop_error:  # noqa: BLE001 - keep the loop alive
+                print(f"export loop: {loop_error}", flush=True)
+
+    threading.Thread(target=export_loop, daemon=True).start()
     yield
+    stop_exports.set()
     pool.close()
 
 
@@ -272,7 +299,12 @@ def adapter_checkpoints() -> dict[str, list[str]]:
         if (adapter_dir / "adapter_model.safetensors").exists():
             checkpoints.append("final")
         if checkpoints:
-            adapters[adapter_dir.name] = [BASE_CHECKPOINT, *checkpoints]
+            merged = [
+                f"{MERGED_PREFIX}{entry['checkpoint']}"
+                for entry in read_exports()
+                if entry.get("adapter_name") == adapter_dir.name and entry.get("state") == "ready"
+            ]
+            adapters[adapter_dir.name] = [BASE_CHECKPOINT, *checkpoints, *sorted(merged)]
     return adapters
 
 
@@ -371,18 +403,53 @@ def evaluation_job_status(client=None) -> dict:
         return {"state": "unavailable", "progress": None, "summary": None, "logs": "", "error": str(error)}
 
 
-def training_metrics(raw_logs: str) -> list[dict]:
-    prefix = "BIELIK_METRIC "
-    metrics = []
-    for line in raw_logs.splitlines():
-        start = line.find(prefix)
-        if start < 0:
-            continue
+def prefixed_json(raw_logs: str, prefix: str) -> list[dict]:
+    """Extract JSON payloads after a prefix, tolerating other output glued to the same line."""
+    decoder = json.JSONDecoder()
+    payloads = []
+    for match in re.finditer(re.escape(prefix), raw_logs):
         try:
-            metrics.append(json.loads(line[start + len(prefix):]))
+            payload, _ = decoder.raw_decode(raw_logs, match.end())
         except json.JSONDecodeError:
             continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def bounded_exp(value: float) -> float:
+    return math.exp(min(value, 50.0))
+
+
+def enrich_training_metrics(metrics: list[dict]) -> list[dict]:
+    """Add perplexity, train/eval gap and throughput derived from the raw trainer logs."""
+    previous: dict | None = None
+    recent_losses: list[float] = []
+    for entry in metrics:
+        loss = entry.get("loss")
+        if isinstance(loss, (int, float)):
+            entry["perplexity"] = bounded_exp(loss)
+            if previous is not None:
+                seconds = entry["time"] - previous["time"]
+                steps = entry["step"] - previous["step"]
+                tokens = entry.get("num_tokens", 0) - previous.get("num_tokens", 0)
+                if seconds > 0 and steps > 0:
+                    entry["seconds_per_step"] = seconds / steps
+                    if tokens > 0:
+                        entry["tokens_per_second"] = tokens / seconds
+            previous = entry
+            recent_losses.append(loss)
+        eval_loss = entry.get("eval_loss")
+        if isinstance(eval_loss, (int, float)):
+            entry["eval_perplexity"] = bounded_exp(eval_loss)
+            if recent_losses:
+                entry["generalization_gap"] = eval_loss - sum(recent_losses) / len(recent_losses)
+            recent_losses = []
     return metrics
+
+
+def training_metrics(raw_logs: str) -> list[dict]:
+    return enrich_training_metrics(prefixed_json(raw_logs, "BIELIK_METRIC "))
 
 
 def training_hyperparameters(adapter_name: str | None) -> dict | None:
@@ -427,6 +494,8 @@ def training_job_status(client=None) -> dict:
             "started_at": state.get("StartedAt"),
             "finished_at": state.get("FinishedAt"),
             "metrics": training_metrics(all_logs),
+            "dataset_stats": next(iter(prefixed_json(all_logs, "BIELIK_DATASET ")[-1:]), None),
+            "lora_layers": next(iter(prefixed_json(all_logs, "BIELIK_LORA ")[-1:]), None),
             "hyperparameters": training_hyperparameters(adapter_name),
             "job": {
                 "corpus_id": labels.get("com.bielik-lab.corpus_id"),
@@ -511,7 +580,7 @@ def export_training_splits(request: Request, corpus_id: UUID) -> dict[str, int]:
         for split in ("train", "validation"):
             result = database_connection.execute(
                 """
-                SELECT messages FROM training_examples
+                SELECT messages, metadata->>'flag' AS flag FROM training_examples
                 WHERE corpus_id = %s AND split = %s ORDER BY created_at
                 """,
                 (corpus_id, split),
@@ -520,6 +589,10 @@ def export_training_splits(request: Request, corpus_id: UUID) -> dict[str, int]:
             with (TRAINING_EXPORT_DIR / f"{split}.jsonl").open("w", encoding="utf-8") as export_file:
                 for row in rows:
                     export_file.write(json.dumps({"messages": row["messages"]}, ensure_ascii=False) + "\n")
+            # Flags live in a sidecar so the SFT dataset keeps only the columns it understands.
+            with (TRAINING_EXPORT_DIR / f"{split}.meta.jsonl").open("w", encoding="utf-8") as meta_file:
+                for row in rows:
+                    meta_file.write(json.dumps({"flag": row["flag"]}) + "\n")
             counts[split] = len(rows)
     return counts
 
@@ -987,6 +1060,7 @@ def start_training(payload: TrainingStart, request: Request) -> dict:
                 "data:",
                 "  train: data/exports/train.jsonl",
                 "  validation: data/exports/validation.jsonl",
+                "validation_meta: data/exports/validation.meta.jsonl",
                 f"output_dir: {output_dir}",
                 "lora:",
                 "  rank: 16",
@@ -1117,6 +1191,17 @@ def start_evaluation(payload: EvaluationStart, request: Request) -> dict:
 
     base_model = adapter_base_model(payload.adapter_name)
     adapter_path = f"artifacts/adapters/{payload.adapter_name}"
+    ollama_models = {
+        f"{MERGED_PREFIX}{entry['checkpoint']}": entry["model_name"]
+        for entry in read_exports()
+        if entry.get("adapter_name") == payload.adapter_name and entry.get("state") == "ready"
+    }
+    ollama_arguments = [
+        argument
+        for checkpoint in checkpoints
+        if checkpoint in ollama_models
+        for argument in ("--ollama-model", f"{checkpoint}={ollama_models[checkpoint]}")
+    ]
     try:
         client.containers.run(
             image=os.environ.get("TRAINER_IMAGE", "bielik-lab-trainer:local"),
@@ -1134,6 +1219,7 @@ def start_evaluation(payload: EvaluationStart, request: Request) -> dict:
                 f"data/exports/{data_path.name}",
                 "--output",
                 f"artifacts/evaluations/{run_name}",
+                *ollama_arguments,
             ],
             working_dir="/workspace",
             detach=True,
@@ -1144,6 +1230,7 @@ def start_evaluation(payload: EvaluationStart, request: Request) -> dict:
                 "TRANSFORMERS_OFFLINE": "1",
                 "HF_HUB_DISABLE_PROGRESS_BARS": "1",
                 "PYTHONUNBUFFERED": "1",
+                "OLLAMA_HOST": os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434"),
             },
             volumes={
                 str(Path(host_root) / "artifacts"): {"bind": "/workspace/artifacts", "mode": "rw"},
@@ -1248,7 +1335,9 @@ def get_serving_status() -> dict:
 
 @app.post("/api/serving/deploy")
 def deploy_checkpoint(payload: ServingDeploy) -> dict:
-    if payload.checkpoint not in adapter_checkpoints().get(payload.adapter_name, []):
+    if payload.checkpoint.startswith(MERGED_PREFIX) or payload.checkpoint not in adapter_checkpoints().get(
+        payload.adapter_name, []
+    ):
         raise HTTPException(status_code=404, detail="Nie znaleziono wskazanego adaptera lub checkpointu.")
     host_root = os.environ.get("TRAINING_HOST_ROOT")
     if not host_root:
@@ -1315,6 +1404,243 @@ def stop_serving() -> dict:
         raise HTTPException(status_code=409, detail="Żaden checkpoint nie jest wdrożony.")
     container.remove(force=True)
     return serving_status(client)
+
+
+EXPORT_CONTAINER = "bielik-lab-export"
+EXPORTS_DIR = Path("/workspace/artifacts/ollama")
+EXPORT_REGISTRY_DIR = EXPORTS_DIR / "exports"
+EXPORT_STAGES = ["merge", "convert", "quantize", "cleanup", "register"]
+EXPORT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}--(final|checkpoint-\d+)$")
+EXPORT_LOCK = threading.Lock()
+MERGED_PREFIX = "merged-"
+TOKENIZER_FILES = (
+    "tokenizer.model",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "generation_config.json",
+)
+
+
+def read_exports() -> list[dict]:
+    if not EXPORT_REGISTRY_DIR.exists():
+        return []
+    entries = []
+    for path in EXPORT_REGISTRY_DIR.glob("*.json"):
+        try:
+            entries.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return sorted(entries, key=lambda entry: entry.get("started_at", 0), reverse=True)
+
+
+def write_export(entry: dict) -> None:
+    EXPORT_REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    (EXPORT_REGISTRY_DIR / f"{entry['id']}.json").write_text(
+        json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def start_export_stage(client, entry: dict) -> None:
+    host_root = os.environ.get("TRAINING_HOST_ROOT")
+    if not host_root:
+        raise HTTPException(status_code=503, detail="TRAINING_HOST_ROOT is not configured.")
+    build_volume = os.environ.get("BUILD_VOLUME", "bielik-build")
+    try:
+        client.volumes.get(build_volume)
+    except NotFound:
+        client.volumes.create(build_volume)
+    stage = entry["stage"]
+    build = f"/build/{entry['id']}"
+    trainer_image = os.environ.get("TRAINER_IMAGE", "bielik-lab-trainer:local")
+    llama_image = os.environ.get("LLAMA_CPP_IMAGE", "ghcr.io/ggml-org/llama.cpp:full")
+    artifacts = str(Path(host_root) / "artifacts")
+    src = {str(Path(host_root) / "src"): {"bind": "/workspace/src", "mode": "ro"}}
+    build_mount = {build_volume: {"bind": "/build", "mode": "rw"}}
+    if stage == "merge":
+        base = adapter_base_model(entry["adapter_name"])
+        adapter_path = f"artifacts/adapters/{entry['adapter_name']}"
+        if entry["checkpoint"] != "final":
+            adapter_path += f"/{entry['checkpoint']}"
+        merged = shlex.quote(f"{build}/merged")
+        # save_pretrained of the fast tokenizer drops tokenizer.model, which the GGUF converter needs.
+        copy_tokenizer = " ".join(
+            f"[ -f {shlex.quote(f'{base}/{name}')} ] && cp {shlex.quote(f'{base}/{name}')} {merged}/;"
+            for name in TOKENIZER_FILES
+        )
+        image, command = trainer_image, [
+            "sh",
+            "-c",
+            f"set -e; rm -rf {merged}; bielik-lab adapter merge --base-model {shlex.quote(base)} "
+            f"--adapter {shlex.quote(adapter_path)} --output {merged}; set +e; {copy_tokenizer} du -sh {merged}",
+        ]
+        volumes = {
+            artifacts: {"bind": "/workspace/artifacts", "mode": "ro"},
+            **models_mount(client, host_root),
+            **src,
+            **build_mount,
+        }
+    elif stage == "convert":
+        image, volumes = llama_image, build_mount
+        command = ["--convert", f"{build}/merged", "--outfile", f"{build}/f16.gguf", "--outtype", "f16"]
+    elif stage == "quantize":
+        image = llama_image
+        command = ["--quantize", f"{build}/f16.gguf", f"/out/{entry['gguf']}", entry["quantization"]]
+        volumes = {**build_mount, str(Path(host_root) / "artifacts" / "ollama"): {"bind": "/out", "mode": "rw"}}
+    elif stage == "cleanup":
+        image, volumes = trainer_image, build_mount
+        command = ["sh", "-c", f"rm -rf {shlex.quote(build)} && echo 'Usunięto pliki pośrednie {build}'"]
+    else:
+        image = trainer_image
+        command = ["bielik-lab", "ollama-register", "--gguf", f"artifacts/ollama/{entry['gguf']}", "--name", entry["model_name"]]
+        volumes = {artifacts: {"bind": "/workspace/artifacts", "mode": "rw"}, **src}
+    previous = training_container(client, EXPORT_CONTAINER)
+    if previous is not None:
+        previous.remove(force=True)
+    client.containers.run(
+        image=image,
+        name=EXPORT_CONTAINER,
+        command=command,
+        working_dir="/workspace",
+        detach=True,
+        init=True,
+        environment={
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+            "PYTHONUNBUFFERED": "1",
+            "OLLAMA_HOST": os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434"),
+        },
+        volumes=volumes,
+        labels={"com.bielik-lab.role": "export", "com.bielik-lab.export": entry["id"], "com.bielik-lab.stage": stage},
+    )
+    entry["stage_started_at"] = time.time()
+
+
+def advance_exports(client=None) -> None:
+    """Move a running export to its next stage once the current stage container has exited."""
+    with EXPORT_LOCK:
+        entry = next((item for item in read_exports() if item.get("state") == "running"), None)
+        if entry is None:
+            return
+        client = client or docker.from_env()
+        container = training_container(client, EXPORT_CONTAINER)
+        labels = (container.attrs["Config"].get("Labels") or {}) if container else {}
+        if container is None or labels.get("com.bielik-lab.export") != entry["id"] or labels.get(
+            "com.bielik-lab.stage"
+        ) != entry["stage"]:
+            start_export_stage(client, entry)
+            write_export(entry)
+            return
+        container.reload()
+        if container.status in ("created", "running", "restarting"):
+            return
+        exit_code = container.attrs["State"].get("ExitCode")
+        now = time.time()
+        entry.setdefault("stages", {})[entry["stage"]] = {"seconds": now - entry.get("stage_started_at", now)}
+        if exit_code != 0:
+            entry.update(
+                state="failed",
+                finished_at=now,
+                error=f"Etap {entry['stage']} zakończył się kodem {exit_code}.",
+                log_tail=container.logs(tail=40).decode("utf-8", errors="replace"),
+            )
+        elif entry["stage"] == EXPORT_STAGES[-1]:
+            gguf = EXPORTS_DIR / entry["gguf"]
+            entry.update(state="ready", finished_at=now, gguf_bytes=gguf.stat().st_size if gguf.exists() else None)
+        else:
+            entry["stage"] = EXPORT_STAGES[EXPORT_STAGES.index(entry["stage"]) + 1]
+            start_export_stage(client, entry)
+        write_export(entry)
+
+
+def exports_status() -> dict:
+    logs = ""
+    try:
+        advance_exports()
+        container = training_container(training_client(), EXPORT_CONTAINER)
+        if container is not None:
+            logs = container.logs(tail=300).decode("utf-8", errors="replace")
+    except (DockerException, HTTPException) as error:
+        logs = str(error)
+    return {"exports": read_exports(), "stages": EXPORT_STAGES, "logs": logs}
+
+
+@app.get("/api/exports")
+def list_exports() -> dict:
+    return exports_status()
+
+
+@app.post("/api/exports")
+def start_export(payload: ExportStart) -> dict:
+    if payload.checkpoint not in adapter_checkpoints().get(payload.adapter_name, []):
+        raise HTTPException(status_code=404, detail="Nie znaleziono wskazanego adaptera lub checkpointu.")
+    client = training_client()
+    if gpu_job_running(client, TRAINING_CONTAINER):
+        raise HTTPException(status_code=409, detail="Trwa trening. Merge potrzebuje ~25 GB RAM, uruchom go po treningu.")
+    with EXPORT_LOCK:
+        if any(entry.get("state") == "running" for entry in read_exports()):
+            raise HTTPException(status_code=409, detail="Trwa inny eksport. Poczekaj na jego koniec.")
+        export_id = f"{payload.adapter_name}--{payload.checkpoint}"
+        entry = {
+            "id": export_id,
+            "adapter_name": payload.adapter_name,
+            "checkpoint": payload.checkpoint,
+            "quantization": payload.quantization,
+            "model_name": payload.model_name or f"{payload.adapter_name}-{payload.checkpoint}",
+            "gguf": f"{export_id}-{payload.quantization}.gguf",
+            "state": "running",
+            "stage": EXPORT_STAGES[0],
+            "stages": {},
+            "started_at": time.time(),
+        }
+        try:
+            start_export_stage(client, entry)
+        except APIError as error:
+            raise HTTPException(status_code=503, detail=f"Nie udało się uruchomić eksportu: {error.explanation}") from error
+        write_export(entry)
+    return exports_status()
+
+
+@app.delete("/api/exports/{export_id}")
+def delete_export(export_id: str) -> dict:
+    if not EXPORT_ID_PATTERN.match(export_id):
+        raise HTTPException(status_code=404, detail="Nie znaleziono eksportu.")
+    path = EXPORT_REGISTRY_DIR / f"{export_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Nie znaleziono eksportu.")
+    entry = json.loads(path.read_text(encoding="utf-8"))
+    if entry.get("state") == "running":
+        raise HTTPException(status_code=409, detail="Eksport jest w toku.")
+    ollama_host = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434").rstrip("/")
+    try:
+        urllib_request.urlopen(
+            urllib_request.Request(
+                f"{ollama_host}/api/delete",
+                data=json.dumps({"model": entry["model_name"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="DELETE",
+            ),
+            timeout=30,
+        ).close()
+    except OSError:
+        pass  # Already removed from Ollama or Ollama is not running.
+    gguf = EXPORTS_DIR / Path(entry.get("gguf", "")).name
+    if gguf.is_file():
+        gguf.unlink()
+    if entry.get("state") == "failed":
+        # A failed export can leave ~40 GB of merged weights in the build volume.
+        client = training_client()
+        client.containers.run(
+            image=os.environ.get("TRAINER_IMAGE", "bielik-lab-trainer:local"),
+            command=["rm", "-rf", f"/build/{export_id}"],
+            volumes={os.environ.get("BUILD_VOLUME", "bielik-build"): {"bind": "/build", "mode": "rw"}},
+            detach=True,
+            remove=True,
+        )
+    path.unlink()
+    return exports_status()
 
 
 @app.post("/api/corpora", status_code=status.HTTP_201_CREATED)
@@ -1408,7 +1734,7 @@ def import_examples(corpus_id: UUID, payload: ExamplesImport, request: Request) 
                             example.split,
                             json.dumps([message.model_dump() for message in example.messages]),
                             example.source,
-                            json.dumps({"flag": "unclassified", "import_id": import_id}),
+                            json.dumps({"flag": example.flag, "import_id": import_id}),
                         )
                         for example in payload.examples
                     ],
@@ -1537,6 +1863,79 @@ def bulk_set_split(payload: BulkSplit, request: Request) -> dict[str, int]:
                 (payload.split, payload.example_ids),
             )
     return {"updated": result.rowcount}
+
+
+REVISIONS_DIR = Path("/workspace/data/revisions")
+
+
+@app.post("/api/examples/bulk/transform")
+def bulk_transform(payload: BulkTransform, request: Request) -> dict:
+    with request.app.state.pool.connection() as database_connection:
+        with database_connection.transaction():
+            rows = database_connection.execute(
+                "SELECT id, messages FROM training_examples WHERE id = ANY(%s) FOR UPDATE",
+                (payload.example_ids,),
+            ).fetchall()
+            changes = []
+            skipped: dict[str, int] = {}
+            for row in rows:
+                new_messages, reason = transform_messages(row["messages"], payload.transform)
+                if new_messages is None:
+                    skipped[reason] = skipped.get(reason, 0) + 1
+                else:
+                    changes.append((row, new_messages))
+            result = {
+                "matched": len(changes),
+                "skipped": skipped,
+                "samples": [
+                    {
+                        "id": str(row["id"]),
+                        "before": next((m["content"] for m in reversed(row["messages"]) if m.get("role") == "assistant"), ""),
+                        "after": next((m["content"] for m in reversed(new) if m.get("role") == "assistant"), ""),
+                    }
+                    for row, new in changes[:3]
+                ],
+                "revision_id": None,
+            }
+            if payload.dry_run or not changes:
+                return result
+            revision_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+            REVISIONS_DIR.mkdir(parents=True, exist_ok=True)
+            # Original messages are kept so the bulk edit can be reverted.
+            (REVISIONS_DIR / f"{revision_id}.json").write_text(
+                json.dumps(
+                    {
+                        "transform": payload.transform,
+                        "created_at": time.time(),
+                        "rows": [{"id": str(row["id"]), "messages": row["messages"]} for row, _ in changes],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with database_connection.cursor() as cursor:
+                cursor.executemany(
+                    "UPDATE training_examples SET messages = %s::jsonb WHERE id = %s",
+                    [(json.dumps(new, ensure_ascii=False), row["id"]) for row, new in changes],
+                )
+    return {**result, "revision_id": revision_id}
+
+
+@app.post("/api/revisions/{revision_id}/revert")
+def revert_revision(revision_id: str, request: Request) -> dict[str, int]:
+    path = REVISIONS_DIR / f"{revision_id}.json"
+    if not TRASH_ID_PATTERN.match(revision_id) or not path.exists():
+        raise HTTPException(status_code=404, detail="Nie znaleziono zapisanej wersji do cofnięcia.")
+    rows = json.loads(path.read_text(encoding="utf-8"))["rows"]
+    with request.app.state.pool.connection() as database_connection:
+        with database_connection.transaction():
+            with database_connection.cursor() as cursor:
+                cursor.executemany(
+                    "UPDATE training_examples SET messages = %s::jsonb WHERE id = %s",
+                    [(json.dumps(row["messages"], ensure_ascii=False), row["id"]) for row in rows],
+                )
+    path.rename(path.with_suffix(".reverted"))
+    return {"reverted": len(rows)}
 
 
 @app.post("/api/examples/bulk/system-prompt")
@@ -1734,7 +2133,7 @@ def update_example(example_id: UUID, payload: ExampleCreate, request: Request) -
                 """
                 UPDATE training_examples
                 SET split = %s, messages = %s::jsonb,
-                    metadata = metadata || jsonb_build_object('flag', %s)
+                    metadata = metadata || jsonb_build_object('flag', %s::text)
                 WHERE id = %s
                 RETURNING id, corpus_id, split, messages, metadata, created_at
                 """,

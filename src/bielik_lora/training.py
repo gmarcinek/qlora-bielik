@@ -20,6 +20,14 @@ def _format_conversation(example: dict[str, Any], tokenizer: Any) -> dict[str, s
     return {"text": tokenizer.apply_chat_template(example["messages"], tokenize=False)}
 
 
+def _read_flags(path: str | None, count: int) -> list[str | None]:
+    if not path or not Path(path).exists():
+        return [None] * count
+    with Path(path).open(encoding="utf-8") as meta_file:
+        flags = [json.loads(line).get("flag") for line in meta_file if line.strip()]
+    return flags if len(flags) == count else [None] * count
+
+
 def train(config_path: Path) -> None:
     """Fine-tune Bielik with LoRA or QLoRA from JSONL ChatML conversations."""
     from datasets import load_dataset
@@ -33,7 +41,24 @@ def train(config_path: Path) -> None:
     )
     from trl import SFTConfig, SFTTrainer
 
+    from bielik_lora.training_metrics import (
+        DATASET_PREFIX,
+        LORA_PREFIX,
+        GpuSampler,
+        example_groups,
+        layer_index,
+        length_stats,
+    )
+
     class MetricsCallback(TrainerCallback):
+        def __init__(self, validation: list[tuple[list[int], list[str]]]) -> None:
+            self.validation = validation
+            self.gpu = GpuSampler()
+            self.model: Any = None
+            self.layer_grads: dict[int, float] = {}
+            self.lora_grad_norm: float | None = None
+            self.lora_every = 1
+
         def emit(self, state: Any, logs: dict[str, Any]) -> None:
             metrics = {
                 key: value
@@ -43,11 +68,88 @@ def train(config_path: Path) -> None:
             entry = {"step": state.global_step, "max_steps": state.max_steps, "time": time.time(), **metrics}
             print(METRIC_PREFIX + json.dumps(entry), flush=True)
 
+        def lora_parameters(self) -> list[tuple[str, Any]]:
+            if self.model is None:
+                return []
+            return [(name, parameter) for name, parameter in self.model.named_parameters() if "lora_" in name]
+
         def on_train_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-            self.emit(state, {"num_train_epochs": args.num_train_epochs})
+            self.model = kwargs.get("model")
+            self.lora_every = max(1, state.max_steps // 24)
+            torch.cuda.reset_peak_memory_stats()
+            self.emit(state, {"num_train_epochs": args.num_train_epochs, "max_grad_norm": args.max_grad_norm})
+
+        def on_pre_optimizer_step(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            # Gradients here are already clipped and accumulated over the whole step.
+            squares: dict[int, float] = {}
+            total = 0.0
+            for name, parameter in self.lora_parameters():
+                if parameter.grad is None:
+                    continue
+                square = float(parameter.grad.detach().float().pow(2).sum())
+                total += square
+                if (layer := layer_index(name)) is not None:
+                    squares[layer] = squares.get(layer, 0.0) + square
+            self.layer_grads = {layer: square**0.5 for layer, square in squares.items()}
+            self.lora_grad_norm = total**0.5 if squares else None
 
         def on_log(self, args: Any, state: Any, control: Any, logs: dict | None = None, **kwargs: Any) -> None:
-            self.emit(state, logs or {})
+            logs = dict(logs or {})
+            if "loss" in logs:
+                logs.update(self.gpu.drain())
+                if torch.cuda.is_available():
+                    logs["vram_peak_gb"] = torch.cuda.max_memory_allocated() / 2**30
+                    logs["vram_reserved_gb"] = torch.cuda.memory_reserved() / 2**30
+                    torch.cuda.reset_peak_memory_stats()
+                logs.update(self.lora_norms(state))
+            self.emit(state, logs)
+
+        def lora_norms(self, state: Any) -> dict[str, float]:
+            norms = {"lora_A": 0.0, "lora_B": 0.0}
+            layer_b: dict[int, float] = {}
+            for name, parameter in self.lora_parameters():
+                square = float(parameter.detach().float().pow(2).sum())
+                kind = "lora_A" if "lora_A" in name else "lora_B"
+                norms[kind] += square
+                if kind == "lora_B" and (layer := layer_index(name)) is not None:
+                    layer_b[layer] = layer_b.get(layer, 0.0) + square
+            if not layer_b:
+                return {}
+            if state.global_step % self.lora_every == 0 or state.global_step >= state.max_steps:
+                layers = [
+                    {"layer": layer, "b_norm": layer_b[layer] ** 0.5, "grad_norm": self.layer_grads.get(layer)}
+                    for layer in sorted(layer_b)
+                ]
+                print(LORA_PREFIX + json.dumps({"step": state.global_step, "layers": layers}), flush=True)
+            result = {"lora_a_norm": norms["lora_A"] ** 0.5, "lora_b_norm": norms["lora_B"] ** 0.5}
+            if self.lora_grad_norm is not None:
+                result["lora_grad_norm"] = self.lora_grad_norm
+            return result
+
+        def on_evaluate(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            model = kwargs.get("model") or self.model
+            if model is None or not self.validation:
+                return
+            was_training = model.training
+            model.eval()
+            device = model.get_input_embeddings().weight.device
+            sums: dict[str, float] = {}
+            tokens: dict[str, int] = {}
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                for input_ids, groups in self.validation:
+                    if len(input_ids) < 2:
+                        continue
+                    ids = torch.tensor([input_ids], device=device)
+                    loss = float(model(input_ids=ids, labels=ids).loss)
+                    for group in groups:
+                        sums[group] = sums.get(group, 0.0) + loss * (len(input_ids) - 1)
+                        tokens[group] = tokens.get(group, 0) + len(input_ids) - 1
+            if was_training:
+                model.train()
+            self.emit(state, {f"group_loss/{group}": sums[group] / tokens[group] for group in sums})
+
+        def on_train_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            self.gpu.stop()
 
     config = load_config(config_path)
     model_config = config["model"]
@@ -77,6 +179,25 @@ def train(config_path: Path) -> None:
     model.config.use_cache = training_config.get("use_cache", False)
     dataset = load_dataset("json", data_files=config["data"])
     formatted = dataset.map(lambda example: _format_conversation(example, tokenizer))
+    max_length = training_config["max_length"]
+    token_ids = {
+        split: tokenizer(formatted[split]["text"], add_special_tokens=False)["input_ids"] for split in formatted
+    }
+    validation: list[tuple[list[int], list[str]]] = []
+    group_counts: dict[str, int] = {}
+    if "validation" in formatted:
+        flags = _read_flags(config.get("validation_meta"), len(formatted["validation"]))
+        for ids, messages, flag in zip(token_ids["validation"], formatted["validation"]["messages"], flags):
+            groups = example_groups(messages, flag)
+            validation.append((ids[:max_length], groups))
+            for group in groups:
+                group_counts[group] = group_counts.get(group, 0) + 1
+    dataset_stats = {
+        "max_length": max_length,
+        "splits": {split: length_stats([len(ids) for ids in token_ids[split]], max_length) for split in token_ids},
+        "groups": group_counts,
+    }
+    print(DATASET_PREFIX + json.dumps(dataset_stats, ensure_ascii=False), flush=True)
     training_args = SFTConfig(
         output_dir=config["output_dir"],
         num_train_epochs=training_config["epochs"],
@@ -113,7 +234,7 @@ def train(config_path: Path) -> None:
         eval_dataset=formatted.get("validation"),
         peft_config=adapter_config,
         processing_class=tokenizer,
-        callbacks=[MetricsCallback()],
+        callbacks=[MetricsCallback(validation[:200])],
     )
     trainer.train()
     trainer.save_model(config["output_dir"])
