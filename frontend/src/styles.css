@@ -230,3 +230,4 @@ body { min-width: 320px; background: #eef2ee; }
 .example-issues ul { padding-left: 1.1rem; }
 .entity-type-row { display: grid; grid-template-columns: 12rem 1fr 1fr auto; gap: .5rem; margin-bottom: .5rem; }
 .entity-type-head { margin-bottom: .25rem; font-weight: 600; }
+.corpus-danger-zone { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 2.5rem; padding: 1rem; border: 1px solid #f1aeb5; border-radius: .375rem; background: #fff5f5; }

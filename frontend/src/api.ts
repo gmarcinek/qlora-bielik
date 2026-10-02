@@ -434,6 +434,11 @@ export type ParaphraseProviderCatalog = {
 
 export const api = {
   corpora: () => request<Corpus[]>("/api/corpora"),
+  deleteCorpus: (corpusId: string) =>
+    request<{ deleted: number; trash_id: string | null; name: string }>(
+      `/api/corpora/${corpusId}`,
+      { method: "DELETE" },
+    ),
   createCorpus: (name: string, description: string) =>
     request<Corpus>("/api/corpora", {
       method: "POST",
@@ -552,7 +557,7 @@ export const api = {
       { method: "DELETE" },
     ),
   restoreTrash: (trashId: string) =>
-    request<{ restored: number }>(`/api/trash/${trashId}/restore`, {
+    request<{ restored: number; corpus_id?: string | null }>(`/api/trash/${trashId}/restore`, {
       method: "POST",
     }),
   bulkTransform: (exampleIds: string[], transform: string, dryRun: boolean) =>
@@ -665,6 +670,14 @@ export const api = {
       adapters: Record<string, string[]>;
       best: Record<string, { checkpoint: string; eval_loss: number }>;
     }>("/api/evaluation/adapters"),
+  deleteAdapter: (adapterName: string, checkpoint?: string) =>
+    request<{
+      adapters: Record<string, string[]>;
+      best: Record<string, { checkpoint: string; eval_loss: number }>;
+    }>(
+      `/api/adapters/${encodeURIComponent(adapterName)}${checkpoint ? `?checkpoint=${encodeURIComponent(checkpoint)}` : ""}`,
+      { method: "DELETE" },
+    ),
   evaluationStatus: () => request<EvaluationStatus>("/api/evaluation/status"),
   startEvaluation: (
     corpusId: string,

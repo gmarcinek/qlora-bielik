@@ -1232,10 +1232,12 @@ function CorpusSettingsView({
   corpusId,
   onSaved,
   section,
+  onDelete,
 }: {
   corpusId: string;
   onSaved: () => void;
   section: "general" | "vocabulary";
+  onDelete?: () => void;
 }) {
   const [settings, setSettings] = useState<CorpusSettings | null>(null);
   const [models, setModels] = useState<AgentModel[]>([]);
@@ -1511,6 +1513,20 @@ function CorpusSettingsView({
       >
         {section === "vocabulary" ? "Zapisz słownik" : "Zapisz ustawienia"}
       </button>
+      {onDelete && (
+        <div className="corpus-danger-zone">
+          <div>
+            <strong className="d-block">Usuń korpus</strong>
+            <small className="text-secondary">
+              Usuwa korpus ze wszystkimi przykładami i propozycjami. Trafia do
+              kosza — można go przywrócić przyciskiem „Cofnij”.
+            </small>
+          </div>
+          <button className="btn btn-outline-danger" type="button" onClick={onDelete}>
+            <Trash2 size={16} className="me-1" /> Usuń korpus
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -2297,17 +2313,47 @@ function CorporaPage({
   const [lastDeletion, setLastDeletion] = useState<{
     trashId: string;
     count: number;
+    corpusName?: string;
   } | null>(null);
+  async function deleteCorpus() {
+    if (!selectedCorpus) return;
+    if (
+      !window.confirm(
+        `Usunąć korpus „${selectedCorpus.name}” razem z ${selectedCorpus.example_count} przykładami i propozycjami?\n\nKorpus trafi do kosza — można go przywrócić przyciskiem „Cofnij”.`,
+      )
+    )
+      return;
+    setBusy(true);
+    setImportError("");
+    try {
+      const result = await api.deleteCorpus(selectedCorpus.id);
+      if (result.trash_id)
+        setLastDeletion({ trashId: result.trash_id, count: result.deleted, corpusName: result.name });
+      onCorpusUpdated();
+      navigate("/corpora");
+    } catch (error) {
+      setImportError(
+        error instanceof Error ? error.message : "Nie udało się usunąć korpusu.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
   async function undoDeletion() {
     if (!lastDeletion) return;
     setBusy(true);
     setImportError("");
     try {
       const result = await api.restoreTrash(lastDeletion.trashId);
-      setExamples(await loadExamples());
       setLastDeletion(null);
-      setImportNotice(`Przywrócono przykłady: ${result.restored}.`);
+      setImportNotice(
+        result.corpus_id
+          ? `Przywrócono korpus z przykładami: ${result.restored}.`
+          : `Przywrócono przykłady: ${result.restored}.`,
+      );
       onCorpusUpdated();
+      if (result.corpus_id) navigate(`/corpora/${result.corpus_id}`);
+      else setExamples(await loadExamples());
     } catch (error) {
       setImportError(
         error instanceof Error
@@ -3251,7 +3297,11 @@ function CorporaPage({
         )}
         {lastDeletion && (
           <div className="alert alert-warning d-flex justify-content-between align-items-center gap-2">
-            <span>Usunięto przykłady: {lastDeletion.count}.</span>
+            <span>
+              {lastDeletion.corpusName
+                ? `Usunięto korpus „${lastDeletion.corpusName}” (przykładów: ${lastDeletion.count}).`
+                : `Usunięto przykłady: ${lastDeletion.count}.`}
+            </span>
             <span className="d-flex gap-2">
               <button
                 className="btn btn-sm btn-warning"
@@ -3807,6 +3857,7 @@ function CorporaPage({
             corpusId={corpusId}
             onSaved={onCorpusUpdated}
             section="general"
+            onDelete={() => void deleteCorpus()}
           />
         )}
         {corpusId && activeView === "dpo" && (
@@ -6404,6 +6455,7 @@ function DeploymentPanel({
   exportsStatus,
   trainingRunning,
   onExports,
+  onAdapters,
 }: {
   adapters: Record<string, string[]>;
   best: Record<string, { checkpoint: string; eval_loss: number }>;
@@ -6413,6 +6465,10 @@ function DeploymentPanel({
   exportsStatus: ExportsStatus | null;
   trainingRunning: boolean;
   onExports: (status: ExportsStatus) => void;
+  onAdapters: (result: {
+    adapters: Record<string, string[]>;
+    best: Record<string, { checkpoint: string; eval_loss: number }>;
+  }) => void;
 }) {
   const [adapter, setAdapter] = useState("");
   const [checkpoint, setCheckpoint] = useState("");
@@ -6459,6 +6515,32 @@ function DeploymentPanel({
     )
       return;
     void run(() => api.deployCheckpoint(selectedAdapter, selectedCheckpoint));
+  };
+  const remove = async (checkpointToDelete?: string) => {
+    const target = checkpointToDelete
+      ? `checkpoint ${selectedAdapter}/${checkpointToDelete}`
+      : `CAŁY adapter ${selectedAdapter} (wszystkie checkpointy i final) razem z jego zmergowanymi modelami w Ollamie i plikami GGUF w artifacts/ollama`;
+    if (
+      !window.confirm(
+        `Usunąć z dysku ${target}? Tego nie da się cofnąć.${checkpointToDelete ? " Zmergowane modele w Ollamie zostają (usuwasz je osobno niżej)." : ""}`,
+      )
+    )
+      return;
+    setBusy(true);
+    setError("");
+    try {
+      onAdapters(await api.deleteAdapter(selectedAdapter, checkpointToDelete));
+      if (!checkpointToDelete) setAdapter("");
+      setCheckpoint("");
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : String(requestError),
+      );
+    } finally {
+      setBusy(false);
+    }
   };
   const badge = {
     ready: ["text-bg-success", "Gotowy w czacie"],
@@ -6567,6 +6649,29 @@ function DeploymentPanel({
             GPU zajęte przez trening lub ewaluację — wdrożenie będzie możliwe po
             ich zakończeniu.
           </p>
+        )}
+        {selectedAdapter && (
+          <div className="d-flex flex-wrap gap-2 mt-2">
+            <button
+              className="btn btn-sm btn-outline-danger"
+              type="button"
+              disabled={busy || !selectedCheckpoint || selectedCheckpoint === "base"}
+              onClick={() => void remove(selectedCheckpoint)}
+            >
+              <Trash2 size={14} className="me-1" /> Usuń checkpoint{" "}
+              {selectedCheckpoint && selectedCheckpoint !== "base"
+                ? selectedCheckpoint
+                : ""}
+            </button>
+            <button
+              className="btn btn-sm btn-outline-danger"
+              type="button"
+              disabled={busy}
+              onClick={() => void remove()}
+            >
+              <Trash2 size={14} className="me-1" /> Usuń cały adapter
+            </button>
+          </div>
         )}
         {status?.state === "failed" && (
           <p className="text-danger small mt-2 mb-0">
@@ -7133,6 +7238,10 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
             exportsStatus={exportsStatus}
             trainingRunning={isRunning}
             onExports={setExportsStatus}
+            onAdapters={({ adapters, best }) => {
+              setEvaluationAdapters(adapters);
+              setBestCheckpoints(best);
+            }}
           />
         )}
         {!evaluationOnly && (

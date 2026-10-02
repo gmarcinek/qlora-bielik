@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -1277,6 +1278,54 @@ def stop_training() -> dict:
     return training_job_status(client)
 
 
+@app.delete("/api/adapters/{adapter_name}")
+def delete_adapter(adapter_name: str, checkpoint: str | None = None) -> dict:
+    """Whole adapter (all checkpoints and the final weights) or one checkpoint; merged GGUF exports are separate."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", adapter_name):
+        raise HTTPException(status_code=404, detail="Nie znaleziono adaptera.")
+    if checkpoint is not None and not re.fullmatch(r"final|checkpoint-\d+", checkpoint):
+        raise HTTPException(status_code=422, detail="Niepoprawny checkpoint.")
+    adapter_dir = TRAINING_ARTIFACT_DIR / adapter_name
+    if not adapter_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Nie znaleziono adaptera.")
+    client = training_client()
+    for name, label in ((TRAINING_CONTAINER, "trening"), (EVALUATION_CONTAINER, "ewaluacja")):
+        container = training_container(client, name)
+        if container is not None and gpu_job_running(client, name):
+            uses = (container.attrs["Config"].get("Labels") or {}).get("com.bielik-lab.adapter")
+            if uses in (None, adapter_name):
+                raise HTTPException(status_code=409, detail=f"Trwa {label} tego adaptera — usuń po jej zakończeniu.")
+    serving = serving_status(client)
+    if serving.get("state") in {"ready", "loading"} and serving.get("adapter_name") == adapter_name:
+        if checkpoint is None or serving.get("checkpoint") == checkpoint:
+            raise HTTPException(status_code=409, detail="Ten checkpoint jest wdrożony do czatu — najpierw zatrzymaj wdrożenie.")
+    if any(entry.get("state") == "running" and entry.get("adapter_name") == adapter_name for entry in read_exports()):
+        raise HTTPException(status_code=409, detail="Trwa eksport tego adaptera do Ollamy.")
+    if checkpoint is None:
+        shutil.rmtree(adapter_dir)
+        # Merged GGUF models built from this adapter go too (Ollama registration, GGUF, Modelfile, registry entry).
+        for entry in read_exports():
+            if entry.get("adapter_name") == adapter_name:
+                delete_export(entry["id"])
+        for orphan in EXPORTS_DIR.glob(f"{adapter_name}--*.gguf"):
+            orphan.unlink()
+    elif checkpoint == "final":
+        # Final weights live in the adapter root next to the checkpoint-* folders.
+        files = [path for path in adapter_dir.iterdir() if path.is_file()]
+        if not (adapter_dir / "adapter_model.safetensors").exists():
+            raise HTTPException(status_code=404, detail="Adapter nie ma wersji final.")
+        for path in files:
+            path.unlink()
+    else:
+        checkpoint_dir = adapter_dir / checkpoint
+        if not checkpoint_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Nie znaleziono checkpointu.")
+        shutil.rmtree(checkpoint_dir)
+    if adapter_dir.is_dir() and not any(adapter_dir.iterdir()):
+        adapter_dir.rmdir()
+    return evaluation_adapters()
+
+
 @app.get("/api/evaluation/adapters")
 def evaluation_adapters() -> dict[str, dict]:
     adapters = adapter_checkpoints()
@@ -1824,6 +1873,9 @@ def delete_export(export_id: str) -> dict:
     gguf = EXPORTS_DIR / Path(entry.get("gguf", "")).name
     if gguf.is_file():
         gguf.unlink()
+    modelfile = EXPORTS_DIR / f"Modelfile.{str(entry.get('model_name', '')).replace(':', '_')}"
+    if entry.get("model_name") and modelfile.is_file():
+        modelfile.unlink()
     if entry.get("state") == "failed":
         # A failed export can leave ~40 GB of merged weights in the build volume.
         client = training_client()
@@ -1855,6 +1907,28 @@ def create_corpus(payload: CorpusCreate, request: Request) -> dict:
             if getattr(error, "sqlstate", None) == "23505":
                 raise HTTPException(status_code=409, detail="Corpus name already exists.") from error
             raise
+
+
+@app.delete("/api/corpora/{corpus_id}")
+def delete_corpus(corpus_id: UUID, request: Request) -> dict:
+    """Corpus with all its examples (proposals included) goes to the trash; restoring it brings both back."""
+    with PREFERENCE_LOCK:
+        if PREFERENCE_JOB.get("state") == "running" and PREFERENCE_JOB.get("corpus_id") == str(corpus_id):
+            raise HTTPException(status_code=409, detail="Trwa generowanie par DPO do tego korpusu — przerwij je najpierw.")
+    with request.app.state.pool.connection() as database_connection:
+        with database_connection.transaction():
+            corpus = database_connection.execute(
+                "SELECT id, name, description, settings, created_at FROM corpora WHERE id = %s FOR UPDATE",
+                (corpus_id,),
+            ).fetchone()
+            if corpus is None:
+                raise HTTPException(status_code=404, detail="Corpus not found.")
+            ids = [row["id"] for row in database_connection.execute(
+                "SELECT id FROM training_examples WHERE corpus_id = %s", (corpus_id,)
+            ).fetchall()]
+            deleted, trash_id = delete_to_trash(database_connection, ids, corpus=corpus)
+            database_connection.execute("DELETE FROM corpora WHERE id = %s", (corpus_id,))
+    return {"deleted": deleted, "trash_id": trash_id, "name": corpus["name"]}
 
 
 @app.get("/api/corpora/{corpus_id}/examples")
@@ -2274,8 +2348,11 @@ TRASH_DIR = Path("/workspace/data/trash")
 TRASH_ID_PATTERN = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$")
 
 
-def delete_to_trash(database_connection, example_ids: list[UUID]) -> tuple[int, str | None]:
-    """Delete examples, keeping full rows in a trash file so the deletion can be undone."""
+def delete_to_trash(
+    database_connection, example_ids: list[UUID], corpus: dict | None = None
+) -> tuple[int, str | None]:
+    """Delete examples, keeping full rows in a trash file so the deletion can be undone.
+    With a corpus row, the file also restores the corpus itself."""
     rows = database_connection.execute(
         """
         DELETE FROM training_examples WHERE id = ANY(%s)
@@ -2284,13 +2361,17 @@ def delete_to_trash(database_connection, example_ids: list[UUID]) -> tuple[int, 
         """,
         (example_ids,),
     ).fetchall()
-    if not rows:
+    if not rows and corpus is None:
         return 0, None
     trash_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
     TRASH_DIR.mkdir(parents=True, exist_ok=True)
     # Written inside the transaction: if this fails, the DELETE is rolled back.
     (TRASH_DIR / f"{trash_id}.json").write_text(
-        json.dumps({"deleted_at": time.time(), "rows": rows}, ensure_ascii=False, default=str),
+        json.dumps(
+            {"deleted_at": time.time(), "rows": rows, **({"corpus": corpus} if corpus else {})},
+            ensure_ascii=False,
+            default=str,
+        ),
         encoding="utf-8",
     )
     return len(rows), trash_id
@@ -2306,13 +2387,34 @@ def list_trash() -> list[dict]:
 
 
 @app.post("/api/trash/{trash_id}/restore")
-def restore_trash(trash_id: str, request: Request) -> dict[str, int]:
+def restore_trash(trash_id: str, request: Request) -> dict:
     path = TRASH_DIR / f"{trash_id}.json"
     if not TRASH_ID_PATTERN.match(trash_id) or not path.exists():
-        raise HTTPException(status_code=404, detail="Nie znaleziono usuniętych encji w koszu.")
-    rows = json.loads(path.read_text(encoding="utf-8"))["rows"]
+        raise HTTPException(status_code=404, detail="Nie znaleziono usuniętych przykładów w koszu.")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows, corpus = data["rows"], data.get("corpus")
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
+            if corpus:
+                name = corpus["name"]
+                # The name may have been taken by a new corpus in the meantime (names are unique).
+                if database_connection.execute(
+                    "SELECT 1 FROM corpora WHERE name = %s AND id <> %s", (name, corpus["id"])
+                ).fetchone():
+                    name = f"{name} (przywrócony {time.strftime('%Y-%m-%d %H:%M')})"
+                database_connection.execute(
+                    """
+                    INSERT INTO corpora (id, name, description, settings, created_at)
+                    VALUES (%s, %s, %s, %s::jsonb, %s) ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        corpus["id"],
+                        name,
+                        corpus["description"],
+                        json.dumps(corpus.get("settings") or {}, ensure_ascii=False),
+                        corpus["created_at"],
+                    ),
+                )
             restored = 0
             for row in rows:
                 result = database_connection.execute(
@@ -2335,7 +2437,7 @@ def restore_trash(trash_id: str, request: Request) -> dict[str, int]:
                 )
                 restored += result.rowcount
     path.rename(path.with_suffix(".restored"))
-    return {"restored": restored}
+    return {"restored": restored, "corpus_id": corpus["id"] if corpus else None}
 
 
 @app.put("/api/examples/{example_id}")
