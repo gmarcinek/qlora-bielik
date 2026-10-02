@@ -4,9 +4,11 @@ import json
 import os
 import re
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
+from urllib import request as urllib_request
 from uuid import UUID, uuid4
 
 import docker
@@ -19,6 +21,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 import yaml
 
+from bielik_lora.evaluation import BASE_CHECKPOINT, precision_recall_f1, score_example, summarize
 from bielik_lora.ollama import chat as ollama_chat
 from bielik_lora.ollama import chat_stream, list_models
 from bielik_lora.ollama import generate
@@ -86,6 +89,18 @@ class TrainingStart(BaseModel):
     corpus_id: UUID
     base_model: str = Field(min_length=2, max_length=200)
     adapter_name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
+
+
+class ServingDeploy(BaseModel):
+    adapter_name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
+    checkpoint: str = Field(pattern=r"^(base|final|checkpoint-\d+)$")
+
+
+class EvaluationStart(BaseModel):
+    corpus_id: UUID
+    adapter_name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
+    checkpoints: list[str] = Field(min_length=1, max_length=10)
+    splits: list[Literal["train", "validation", "test"]] = Field(min_length=1)
 
 
 class BulkExamples(BaseModel):
@@ -168,6 +183,11 @@ TRAINING_ARTIFACT_DIR = Path("/workspace/artifacts/adapters")
 BASE_MODELS = ["speakleash/Bielik-11B-v3.0-Instruct"]
 # Paths are relative to the trainer working directory, where ./models is mounted read-only.
 BASE_MODEL_PATHS = {"speakleash/Bielik-11B-v3.0-Instruct": "models/Bielik-11B-v3.0-Instruct"}
+EVALUATION_CONTAINER = "bielik-lab-evaluation"
+EVALUATION_DIR = Path("/workspace/artifacts/evaluations")
+SERVING_CONTAINER = "bielik-lab-serving"
+SERVING_PORT = 8080
+LORA_MODEL_PREFIX = "lora:"
 CLASSIFICATION_LOCK = threading.Lock()
 CLASSIFICATION_JOB: dict[str, int | str | None] = {
     "state": "idle",
@@ -212,11 +232,143 @@ def training_client():
         raise HTTPException(status_code=503, detail=f"Docker is unavailable: {error}") from error
 
 
-def training_container(client):
+def training_container(client, name: str = TRAINING_CONTAINER):
     try:
-        return client.containers.get(TRAINING_CONTAINER)
+        return client.containers.get(name)
     except NotFound:
         return None
+
+
+def models_mount(client, host_root: str) -> dict[str, dict]:
+    # Reading 20 GB from a Windows bind mount (9p) is ~40 MB/s; a WSL-backed volume is far faster.
+    volume = os.environ.get("MODELS_VOLUME", "bielik-models")
+    try:
+        client.volumes.get(volume)
+        source = volume
+    except NotFound:
+        source = str(Path(host_root) / "models")
+    return {source: {"bind": "/workspace/models", "mode": "ro"}}
+
+
+def gpu_job_running(client, name: str) -> bool:
+    container = training_container(client, name)
+    if container is None:
+        return False
+    container.reload()
+    return container.status == "running"
+
+
+def adapter_checkpoints() -> dict[str, list[str]]:
+    adapters: dict[str, list[str]] = {}
+    if not TRAINING_ARTIFACT_DIR.exists():
+        return adapters
+    for adapter_dir in sorted(TRAINING_ARTIFACT_DIR.iterdir()):
+        if not adapter_dir.is_dir():
+            continue
+        checkpoints = sorted(
+            (path.name for path in adapter_dir.glob("checkpoint-*") if (path / "adapter_model.safetensors").exists()),
+            key=lambda name: int(name.removeprefix("checkpoint-")) if name.removeprefix("checkpoint-").isdigit() else 0,
+        )
+        if (adapter_dir / "adapter_model.safetensors").exists():
+            checkpoints.append("final")
+        if checkpoints:
+            adapters[adapter_dir.name] = [BASE_CHECKPOINT, *checkpoints]
+    return adapters
+
+
+def checkpoint_results(output: str, checkpoints: list[str], total: int | None) -> list[dict]:
+    """Live per-checkpoint metrics built from predictions written so far."""
+    results = []
+    for checkpoint in checkpoints:
+        path = EVALUATION_DIR / output / checkpoint / "predictions.jsonl"
+        records = []
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    stored = json.loads(line)
+                except json.JSONDecodeError:
+                    break
+                # Rescore so older runs reflect the current metric definitions.
+                records.append(score_example(stored.get("expected", ""), stored.get("predicted", "")))
+        totals = {mode: {"tp": 0, "fp": 0, "fn": 0} for mode in ("strict", "relaxed")}
+        json_valid = 0
+        curve = []
+        for index, record in enumerate(records, start=1):
+            json_valid += bool(record.get("json_valid"))
+            point = {"n": index, "json_valid": json_valid / index}
+            for mode, counts in totals.items():
+                for bucket in counts:
+                    counts[bucket] += len(record.get(mode, {}).get(bucket, []))
+                scores = precision_recall_f1(**counts)
+                point.update({f"{mode}_{name}": value for name, value in scores.items()})
+            curve.append(point)
+        results.append(
+            {
+                "checkpoint": checkpoint,
+                "done": len(records),
+                "total": total,
+                "finished": (EVALUATION_DIR / output / checkpoint / "summary.json").exists(),
+                "summary": summarize(records) if records else None,
+                "curve": curve,
+            }
+        )
+    return results
+
+
+def evaluation_job_status(client=None) -> dict:
+    try:
+        client = client or training_client()
+        container = training_container(client, EVALUATION_CONTAINER)
+        if container is None:
+            return {"state": "idle", "progress": None, "summary": None, "logs": ""}
+        container.reload()
+        state = container.attrs["State"]
+        labels = container.attrs["Config"].get("Labels") or {}
+        all_logs = container.logs().decode("utf-8", errors="replace")
+        prefix = "BIELIK_EVAL "
+        progress = None
+        for line in all_logs.splitlines():
+            start = line.find(prefix)
+            if start >= 0:
+                try:
+                    progress = json.loads(line[start + len(prefix):])
+                except json.JSONDecodeError:
+                    continue
+        output = labels.get("com.bielik-lab.output", "")
+        summary_path = EVALUATION_DIR / output / "summary.json"
+        comparison_path = EVALUATION_DIR / output / "comparison.json"
+        summary = (
+            json.loads(summary_path.read_text(encoding="utf-8"))
+            if output and summary_path.exists()
+            else None
+        )
+        comparison = (
+            json.loads(comparison_path.read_text(encoding="utf-8"))
+            if output and comparison_path.exists()
+            else []
+        )
+        return {
+            "state": state["Status"],
+            "exit_code": state.get("ExitCode"),
+            "stopped": bool(output) and (EVALUATION_DIR / output / "stopped").exists(),
+            "progress": progress,
+            "summary": summary,
+            "comparison": comparison,
+            "checkpoints": checkpoint_results(
+                output,
+                [item for item in labels.get("com.bielik-lab.checkpoint", "").split(",") if item],
+                (progress or {}).get("total"),
+            )
+            if output
+            else [],
+            "output": f"artifacts/evaluations/{output}" if output else None,
+            "adapter_name": labels.get("com.bielik-lab.adapter"),
+            "checkpoint": labels.get("com.bielik-lab.checkpoint"),
+            "splits": labels.get("com.bielik-lab.splits"),
+            "logs": "\n".join(all_logs.split("\n")[-300:])[-40000:],
+        }
+    except DockerException as error:
+        return {"state": "unavailable", "progress": None, "summary": None, "logs": "", "error": str(error)}
 
 
 def training_metrics(raw_logs: str) -> list[dict]:
@@ -267,7 +419,7 @@ def training_job_status(client=None) -> dict:
         all_logs = container.logs().decode("utf-8", errors="replace")
         raw_logs = "\n".join(all_logs.split("\n")[-300:])
         adapter_name = labels.get("com.bielik-lab.adapter")
-        return {
+        job_status = {
             "state": state["Status"],
             "logs": raw_logs[-16000:],
             "container_id": container.short_id,
@@ -282,8 +434,74 @@ def training_job_status(client=None) -> dict:
                 "adapter_name": adapter_name,
             },
         }
+        if job_status["state"] == "exited":
+            archive_training_run(job_status)
+        return job_status
     except DockerException as error:
         return {"state": "unavailable", "logs": "", "error": str(error), "container_id": None, "metrics": []}
+
+
+TRAINING_RUNS_DIR = Path("/workspace/artifacts/runs")
+RUN_ID_PATTERN = re.compile(r"^[0-9]{14}-[a-z0-9][a-z0-9-]{1,62}$")
+
+
+def training_run_id(job_status: dict) -> str | None:
+    adapter_name = (job_status.get("job") or {}).get("adapter_name")
+    started = re.sub(r"[^0-9]", "", job_status.get("started_at") or "")[:14]
+    return f"{started}-{adapter_name}" if adapter_name and len(started) == 14 else None
+
+
+def archive_training_run(job_status: dict) -> None:
+    """Persist a finished run so it survives removal of its container by the next training."""
+    run_id = training_run_id(job_status)
+    if run_id is None:
+        return
+    path = TRAINING_RUNS_DIR / f"{run_id}.json"
+    if path.exists():
+        return
+    adapter_name = job_status["job"]["adapter_name"]
+    profile_path = TRAINING_EXPORT_DIR / f"{adapter_name}.yaml"
+    TRAINING_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                **job_status,
+                "run_id": run_id,
+                "profile_yaml": profile_path.read_text(encoding="utf-8") if profile_path.exists() else None,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+@app.get("/api/training/runs")
+def list_training_runs() -> list[dict]:
+    runs = []
+    for path in sorted(TRAINING_RUNS_DIR.glob("*.json"), reverse=True):
+        run = json.loads(path.read_text(encoding="utf-8"))
+        metrics = run.get("metrics") or []
+        eval_losses = [metric["eval_loss"] for metric in metrics if "eval_loss" in metric]
+        runs.append(
+            {
+                "run_id": run["run_id"],
+                "adapter_name": run["job"]["adapter_name"],
+                "started_at": run.get("started_at"),
+                "finished_at": run.get("finished_at"),
+                "exit_code": run.get("exit_code"),
+                "steps": max((metric.get("step", 0) for metric in metrics), default=0),
+                "best_eval_loss": min(eval_losses) if eval_losses else None,
+            }
+        )
+    return runs
+
+
+@app.get("/api/training/runs/{run_id}")
+def get_training_run(run_id: str) -> dict:
+    path = TRAINING_RUNS_DIR / f"{run_id}.json"
+    if not RUN_ID_PATTERN.match(run_id) or not path.exists():
+        raise HTTPException(status_code=404, detail="Nie znaleziono runu.")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def export_training_splits(request: Request, corpus_id: UUID) -> dict[str, int]:
@@ -701,17 +919,26 @@ def list_corpora(request: Request) -> list[dict]:
 
 @app.get("/api/models")
 def models() -> dict[str, list[str]]:
+    served = serving_status()
+    lora_models = [served["model"]] if served.get("state") in {"ready", "loading"} else []
     try:
-        return {"models": list_models()}
+        return {"models": [*lora_models, *list_models()]}
     except OSError as error:
+        if lora_models:
+            return {"models": lora_models}
         raise HTTPException(status_code=503, detail=f"Ollama is unavailable: {error}") from error
 
 
 @app.get("/api/training/status")
-def training_status(request: Request) -> dict:
+def training_status(request: Request, corpus_id: UUID | None = None) -> dict:
     with request.app.state.pool.connection() as database_connection:
         result = database_connection.execute(
-            "SELECT split, COUNT(*)::int AS count FROM training_examples GROUP BY split"
+            """
+            SELECT split, COUNT(*)::int AS count FROM training_examples
+            WHERE %(corpus_id)s::uuid IS NULL OR corpus_id = %(corpus_id)s::uuid
+            GROUP BY split
+            """,
+            {"corpus_id": corpus_id},
         )
         splits = {row["split"]: row["count"] for row in result.fetchall()}
     job_status = training_job_status()
@@ -733,6 +960,8 @@ def training_models() -> dict[str, list[str]]:
 def start_training(payload: TrainingStart, request: Request) -> dict:
     if payload.base_model not in BASE_MODELS:
         raise HTTPException(status_code=422, detail="Wybrany model bazowy nie jest obsługiwany przez profil QLoRA.")
+    # Archive the previous run before its profile YAML is overwritten below.
+    training_job_status()
     counts = export_training_splits(request, payload.corpus_id)
     if counts["train"] == 0 or counts["validation"] == 0:
         raise HTTPException(
@@ -778,7 +1007,8 @@ def start_training(payload: TrainingStart, request: Request) -> dict:
                 "  gradient_checkpointing_kwargs: {use_reentrant: false}",
                 "  use_cache: false",
                 "  empty_cache_steps: 10",
-                "  save_total_limit: 2",
+                "  eval_steps: 25",
+                "  save_steps: 25",
                 "",
             ]
         ),
@@ -786,11 +1016,16 @@ def start_training(payload: TrainingStart, request: Request) -> dict:
     )
 
     client = training_client()
+    if gpu_job_running(client, EVALUATION_CONTAINER):
+        raise HTTPException(status_code=409, detail="Trwa ewaluacja adaptera. Poczekaj na jej koniec, GPU nie pomieści obu zadań.")
+    if gpu_job_running(client, SERVING_CONTAINER):
+        raise HTTPException(status_code=409, detail="Checkpoint jest wdrożony do czatu i zajmuje GPU. Zatrzymaj wdrożenie przed treningiem.")
     previous = training_container(client)
     if previous is not None:
         previous.reload()
         if previous.status == "running":
             raise HTTPException(status_code=409, detail="Trening jest już uruchomiony.")
+        training_job_status(client)
         previous.remove(force=True)
 
     try:
@@ -805,7 +1040,7 @@ def start_training(payload: TrainingStart, request: Request) -> dict:
                 str(Path(host_root) / "artifacts"): {"bind": "/workspace/artifacts", "mode": "rw"},
                 str(Path(host_root) / "configs"): {"bind": "/workspace/configs", "mode": "ro"},
                 str(Path(host_root) / "data"): {"bind": "/workspace/data", "mode": "rw"},
-                str(Path(host_root) / "models"): {"bind": "/workspace/models", "mode": "ro"},
+                **models_mount(client, host_root),
                 str(Path(host_root) / "src"): {"bind": "/workspace/src", "mode": "ro"},
             },
             device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
@@ -829,6 +1064,257 @@ def stop_training() -> dict:
         raise HTTPException(status_code=409, detail="Nie ma aktywnego treningu do zatrzymania.")
     container.stop(timeout=15)
     return training_job_status(client)
+
+
+@app.get("/api/evaluation/adapters")
+def evaluation_adapters() -> dict[str, dict[str, list[str]]]:
+    return {"adapters": adapter_checkpoints()}
+
+
+@app.get("/api/evaluation/status")
+def evaluation_status() -> dict:
+    return evaluation_job_status()
+
+
+@app.post("/api/evaluation/start")
+def start_evaluation(payload: EvaluationStart, request: Request) -> dict:
+    available_checkpoints = adapter_checkpoints().get(payload.adapter_name, [])
+    if any(checkpoint not in available_checkpoints for checkpoint in payload.checkpoints):
+        raise HTTPException(status_code=404, detail="Nie znaleziono wskazanego adaptera lub checkpointu.")
+    host_root = os.environ.get("TRAINING_HOST_ROOT")
+    if not host_root:
+        raise HTTPException(status_code=503, detail="TRAINING_HOST_ROOT is not configured.")
+    client = training_client()
+    if gpu_job_running(client, TRAINING_CONTAINER):
+        raise HTTPException(status_code=409, detail="Trwa trening. Ewaluację uruchom po jego zakończeniu, GPU nie pomieści obu zadań.")
+    if gpu_job_running(client, SERVING_CONTAINER):
+        raise HTTPException(status_code=409, detail="Checkpoint jest wdrożony do czatu i zajmuje GPU. Zatrzymaj wdrożenie przed ewaluacją.")
+    previous = training_container(client, EVALUATION_CONTAINER)
+    if previous is not None:
+        previous.reload()
+        if previous.status == "running":
+            raise HTTPException(status_code=409, detail="Ewaluacja jest już uruchomiona.")
+        previous.remove(force=True)
+
+    splits = sorted(set(payload.splits))
+    with request.app.state.pool.connection() as database_connection:
+        rows = database_connection.execute(
+            """
+            SELECT messages FROM training_examples
+            WHERE corpus_id = %s AND split = ANY(%s) ORDER BY created_at
+            """,
+            (payload.corpus_id, splits),
+        ).fetchall()
+    if not rows:
+        raise HTTPException(status_code=422, detail="Wybrane splity korpusu są puste.")
+    checkpoints = list(dict.fromkeys(payload.checkpoints))
+    run_name = f"{payload.adapter_name}/compare-{uuid4().hex[:8]}"
+    data_path = TRAINING_EXPORT_DIR / f"eval-{payload.adapter_name}.jsonl"
+    TRAINING_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    with data_path.open("w", encoding="utf-8") as export_file:
+        for row in rows:
+            export_file.write(json.dumps({"messages": row["messages"]}, ensure_ascii=False) + "\n")
+
+    base_model = adapter_base_model(payload.adapter_name)
+    adapter_path = f"artifacts/adapters/{payload.adapter_name}"
+    try:
+        client.containers.run(
+            image=os.environ.get("TRAINER_IMAGE", "bielik-lab-trainer:local"),
+            name=EVALUATION_CONTAINER,
+            command=[
+                "bielik-lab",
+                "evaluate-checkpoints",
+                "--base-model",
+                base_model,
+                "--adapter-root",
+                adapter_path,
+                "--checkpoints",
+                *checkpoints,
+                "--data",
+                f"data/exports/{data_path.name}",
+                "--output",
+                f"artifacts/evaluations/{run_name}",
+            ],
+            working_dir="/workspace",
+            detach=True,
+            init=True,
+            # tqdm bars rewrite one line with \r; Docker splits it into broken 16 KB chunks.
+            environment={
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+                "PYTHONUNBUFFERED": "1",
+            },
+            volumes={
+                str(Path(host_root) / "artifacts"): {"bind": "/workspace/artifacts", "mode": "rw"},
+                str(Path(host_root) / "data"): {"bind": "/workspace/data", "mode": "ro"},
+                **models_mount(client, host_root),
+                str(Path(host_root) / "src"): {"bind": "/workspace/src", "mode": "ro"},
+            },
+            device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
+            labels={
+                "com.bielik-lab.role": "evaluation",
+                "com.bielik-lab.adapter": payload.adapter_name,
+                "com.bielik-lab.checkpoint": ",".join(checkpoints),
+                "com.bielik-lab.splits": ",".join(splits),
+                "com.bielik-lab.output": run_name,
+            },
+        )
+    except APIError as error:
+        raise HTTPException(status_code=503, detail=f"Nie udało się uruchomić ewaluacji: {error.explanation}") from error
+    return {**evaluation_job_status(client), "exported": len(rows)}
+
+
+@app.post("/api/evaluation/stop")
+def stop_evaluation() -> dict:
+    client = training_client()
+    container = training_container(client, EVALUATION_CONTAINER)
+    if container is None or container.status != "running":
+        raise HTTPException(status_code=409, detail="Nie ma aktywnej ewaluacji do zatrzymania.")
+    output = (container.attrs["Config"].get("Labels") or {}).get("com.bielik-lab.output")
+    if output:
+        (EVALUATION_DIR / output).mkdir(parents=True, exist_ok=True)
+        (EVALUATION_DIR / output / "stopped").touch()
+    container.stop(timeout=15)
+    return evaluation_job_status(client)
+
+
+def adapter_base_model(adapter_name: str) -> str:
+    profile_path = TRAINING_EXPORT_DIR / f"{adapter_name}.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8")) if profile_path.exists() else {}
+    base_model = (profile.get("model") or {}).get("name") or next(iter(BASE_MODEL_PATHS.values()))
+    return BASE_MODEL_PATHS.get(base_model, base_model)
+
+
+def api_network(client) -> str | None:
+    """Network of this API container, so it can reach the serving container by name."""
+    try:
+        networks = client.containers.get(os.environ.get("HOSTNAME", "")).attrs["NetworkSettings"]["Networks"]
+        return next(iter(networks), None)
+    except (NotFound, APIError, KeyError):
+        return None
+
+
+def serving_model_name(adapter_name: str, checkpoint: str) -> str:
+    return f"{LORA_MODEL_PREFIX}{adapter_name}/{checkpoint}"
+
+
+def serving_status(client=None) -> dict:
+    try:
+        client = client or training_client()
+        container = training_container(client, SERVING_CONTAINER)
+    except (DockerException, HTTPException) as error:
+        return {"state": "unavailable", "error": str(error)}
+    if container is None:
+        return {"state": "idle"}
+    container.reload()
+    labels = container.attrs["Config"].get("Labels") or {}
+    adapter_name = labels.get("com.bielik-lab.adapter", "")
+    checkpoint = labels.get("com.bielik-lab.checkpoint", "")
+    logs = container.logs(tail=200).decode("utf-8", errors="replace")
+    result = {
+        "adapter_name": adapter_name,
+        "checkpoint": checkpoint,
+        "model": serving_model_name(adapter_name, checkpoint),
+        "logs": logs,
+    }
+    if container.status != "running":
+        return {**result, "state": "failed", "exit_code": container.attrs["State"].get("ExitCode")}
+    try:
+        with urllib_request.urlopen(f"http://{SERVING_CONTAINER}:{SERVING_PORT}/health", timeout=2) as response:
+            health = json.load(response)
+    except OSError:
+        health = {"ready": False}
+    return {**result, "state": "ready" if health.get("ready") else "loading", "error": health.get("error")}
+
+
+def serving_chat_stream(messages: list[dict[str, str]]):
+    http_request = urllib_request.Request(
+        f"http://{SERVING_CONTAINER}:{SERVING_PORT}/chat",
+        data=json.dumps({"messages": messages, "max_new_tokens": 4096}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib_request.urlopen(http_request, timeout=600) as response:
+        for line in response:
+            if line.strip():
+                yield json.loads(line).get("content", "")
+
+
+@app.get("/api/serving/status")
+def get_serving_status() -> dict:
+    return serving_status()
+
+
+@app.post("/api/serving/deploy")
+def deploy_checkpoint(payload: ServingDeploy) -> dict:
+    if payload.checkpoint not in adapter_checkpoints().get(payload.adapter_name, []):
+        raise HTTPException(status_code=404, detail="Nie znaleziono wskazanego adaptera lub checkpointu.")
+    host_root = os.environ.get("TRAINING_HOST_ROOT")
+    if not host_root:
+        raise HTTPException(status_code=503, detail="TRAINING_HOST_ROOT is not configured.")
+    client = training_client()
+    for name, label in ((TRAINING_CONTAINER, "trening"), (EVALUATION_CONTAINER, "ewaluacja")):
+        if gpu_job_running(client, name):
+            raise HTTPException(status_code=409, detail=f"Trwa {label}. Wdrożenie uruchom po jej zakończeniu, GPU nie pomieści obu zadań.")
+    previous = training_container(client, SERVING_CONTAINER)
+    if previous is not None:
+        previous.remove(force=True)
+    command = [
+        "bielik-lab",
+        "serve-adapter",
+        "--base-model",
+        adapter_base_model(payload.adapter_name),
+        "--name",
+        serving_model_name(payload.adapter_name, payload.checkpoint),
+        "--port",
+        str(SERVING_PORT),
+    ]
+    if payload.checkpoint != BASE_CHECKPOINT:
+        adapter_path = f"artifacts/adapters/{payload.adapter_name}"
+        if payload.checkpoint != "final":
+            adapter_path += f"/{payload.checkpoint}"
+        command += ["--adapter", adapter_path]
+    try:
+        client.containers.run(
+            image=os.environ.get("TRAINER_IMAGE", "bielik-lab-trainer:local"),
+            name=SERVING_CONTAINER,
+            command=command,
+            working_dir="/workspace",
+            detach=True,
+            init=True,
+            network=api_network(client),
+            environment={
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+                "PYTHONUNBUFFERED": "1",
+            },
+            volumes={
+                str(Path(host_root) / "artifacts"): {"bind": "/workspace/artifacts", "mode": "ro"},
+                **models_mount(client, host_root),
+                str(Path(host_root) / "src"): {"bind": "/workspace/src", "mode": "ro"},
+            },
+            device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
+            labels={
+                "com.bielik-lab.role": "serving",
+                "com.bielik-lab.adapter": payload.adapter_name,
+                "com.bielik-lab.checkpoint": payload.checkpoint,
+            },
+        )
+    except APIError as error:
+        raise HTTPException(status_code=503, detail=f"Nie udało się wdrożyć checkpointu: {error.explanation}") from error
+    return serving_status(client)
+
+
+@app.post("/api/serving/stop")
+def stop_serving() -> dict:
+    client = training_client()
+    container = training_container(client, SERVING_CONTAINER)
+    if container is None:
+        raise HTTPException(status_code=409, detail="Żaden checkpoint nie jest wdrożony.")
+    container.remove(force=True)
+    return serving_status(client)
 
 
 @app.post("/api/corpora", status_code=status.HTTP_201_CREATED)
@@ -1165,13 +1651,79 @@ def start_automatic_classification(payload: BulkExamples, request: Request) -> d
 
 
 @app.post("/api/examples/bulk/delete")
-def bulk_delete(payload: BulkExamples, request: Request) -> dict[str, int]:
+def bulk_delete(payload: BulkExamples, request: Request) -> dict:
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
-            result = database_connection.execute(
-                "DELETE FROM training_examples WHERE id = ANY(%s)", (payload.example_ids,)
-            )
-    return {"deleted": result.rowcount}
+            deleted, trash_id = delete_to_trash(database_connection, payload.example_ids)
+    return {"deleted": deleted, "trash_id": trash_id}
+
+
+TRASH_DIR = Path("/workspace/data/trash")
+TRASH_ID_PATTERN = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$")
+
+
+def delete_to_trash(database_connection, example_ids: list[UUID]) -> tuple[int, str | None]:
+    """Delete examples, keeping full rows in a trash file so the deletion can be undone."""
+    rows = database_connection.execute(
+        """
+        DELETE FROM training_examples WHERE id = ANY(%s)
+        RETURNING id, corpus_id, split, messages, source, metadata,
+                  embedding::text AS embedding, created_at
+        """,
+        (example_ids,),
+    ).fetchall()
+    if not rows:
+        return 0, None
+    trash_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    # Written inside the transaction: if this fails, the DELETE is rolled back.
+    (TRASH_DIR / f"{trash_id}.json").write_text(
+        json.dumps({"deleted_at": time.time(), "rows": rows}, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    return len(rows), trash_id
+
+
+@app.get("/api/trash")
+def list_trash() -> list[dict]:
+    entries = []
+    for path in sorted(TRASH_DIR.glob("*.json"), reverse=True)[:50]:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries.append({"trash_id": path.stem, "count": len(data["rows"]), "deleted_at": data["deleted_at"]})
+    return entries
+
+
+@app.post("/api/trash/{trash_id}/restore")
+def restore_trash(trash_id: str, request: Request) -> dict[str, int]:
+    path = TRASH_DIR / f"{trash_id}.json"
+    if not TRASH_ID_PATTERN.match(trash_id) or not path.exists():
+        raise HTTPException(status_code=404, detail="Nie znaleziono usuniętych encji w koszu.")
+    rows = json.loads(path.read_text(encoding="utf-8"))["rows"]
+    with request.app.state.pool.connection() as database_connection:
+        with database_connection.transaction():
+            restored = 0
+            for row in rows:
+                result = database_connection.execute(
+                    """
+                    INSERT INTO training_examples
+                        (id, corpus_id, split, messages, source, metadata, embedding, created_at)
+                    VALUES (%s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::vector, %s)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        row["id"],
+                        row["corpus_id"],
+                        row["split"],
+                        json.dumps(row["messages"], ensure_ascii=False),
+                        row["source"],
+                        json.dumps(row["metadata"], ensure_ascii=False),
+                        row["embedding"],
+                        row["created_at"],
+                    ),
+                )
+                restored += result.rowcount
+    path.rename(path.with_suffix(".restored"))
+    return {"restored": restored}
 
 
 @app.put("/api/examples/{example_id}")
@@ -1199,15 +1751,14 @@ def update_example(example_id: UUID, payload: ExampleCreate, request: Request) -
             return row
 
 
-@app.delete("/api/examples/{example_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_example(example_id: UUID, request: Request) -> Response:
+@app.delete("/api/examples/{example_id}")
+def delete_example(example_id: UUID, request: Request) -> dict:
     with request.app.state.pool.connection() as database_connection:
-        result = database_connection.execute(
-            "DELETE FROM training_examples WHERE id = %s RETURNING id", (example_id,)
-        )
-        if result.fetchone() is None:
-            raise HTTPException(status_code=404, detail="Example not found.")
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+        with database_connection.transaction():
+            deleted, trash_id = delete_to_trash(database_connection, [example_id])
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Example not found.")
+    return {"deleted": deleted, "trash_id": trash_id}
 
 
 @app.get("/api/corpora/{corpus_id}/export")
@@ -1236,6 +1787,15 @@ def chat(payload: ChatRequest) -> dict[str, str] | StreamingResponse:
         messages = [message.model_dump() for message in payload.messages] if payload.messages else [
             {"role": "user", "content": payload.prompt or ""}
         ]
+        if payload.model and payload.model.startswith(LORA_MODEL_PREFIX):
+            if serving_status().get("model") != payload.model:
+                raise HTTPException(status_code=409, detail="Ten checkpoint nie jest już wdrożony.")
+            if payload.stream:
+                return StreamingResponse(
+                    (json.dumps({"content": content}, ensure_ascii=False) + "\n" for content in serving_chat_stream(messages)),
+                    media_type="application/x-ndjson",
+                )
+            return {"response": "".join(serving_chat_stream(messages))}
         if payload.stream:
             def event_stream():
                 for content in chat_stream(

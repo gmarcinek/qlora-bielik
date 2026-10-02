@@ -88,7 +88,7 @@ services:
       - ./artifacts:/workspace/artifacts
       - ./configs:/workspace/configs:ro
       - ./data:/workspace/data
-      - ./models:/workspace/models:ro
+      - bielik-models:/workspace/models:ro
     deploy:
       resources:
         reservations:
@@ -100,3 +100,5 @@ services:
 volumes:
   postgres-data:
   frontend-node-modules:
+  bielik-models:
+    name: bielik-models

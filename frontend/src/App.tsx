@@ -1,4 +1,12 @@
-import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  FormEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   Bot,
   ChevronDown,
@@ -25,6 +33,7 @@ import {
   Navigate,
   Route,
   Routes,
+  useLocation,
   useNavigate,
   useParams,
   useSearchParams,
@@ -35,12 +44,18 @@ import {
   Example,
   ExampleFlag,
   ExampleReview,
+  EvaluationSummary,
+  EvaluationCheckpointResult,
+  EvaluationCurvePoint,
+  EvaluationStatus,
+  ServingStatus,
   ImportedExample,
   Message,
   MessageRole,
   ParaphraseProviderCatalog,
   TrainingMetric,
   TrainingStatus,
+  TrainingRunSummary,
 } from "./api";
 import { PageTemplate } from "./components/PageTemplate";
 import { MediumPageTemplate } from "./components/MediumPageTemplate";
@@ -243,11 +258,13 @@ function CorporaPage({
   onCreated,
   onCorpusUpdated,
   openCreate = false,
+  initialSplit,
 }: {
   corpora: Corpus[];
   onCreated: (corpus: Corpus) => void;
   onCorpusUpdated: () => void;
   openCreate?: boolean;
+  initialSplit?: Split;
 }) {
   const navigate = useNavigate();
   const { corpusId } = useParams();
@@ -282,6 +299,32 @@ function CorporaPage({
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [importNotice, setImportNotice] = useState("");
+  const [lastDeletion, setLastDeletion] = useState<{
+    trashId: string;
+    count: number;
+  } | null>(null);
+  async function undoDeletion() {
+    if (!lastDeletion) return;
+    setBusy(true);
+    setImportError("");
+    try {
+      const result = await api.restoreTrash(lastDeletion.trashId);
+      setExamples(
+        await (corpusId ? api.examples(corpusId) : api.allExamples()),
+      );
+      setLastDeletion(null);
+      setImportNotice(`Przywrócono encje: ${result.restored}.`);
+      onCorpusUpdated();
+    } catch (error) {
+      setImportError(
+        error instanceof Error
+          ? error.message
+          : "Nie udało się przywrócić encji.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
   const [importError, setImportError] = useState("");
   const [importSession, setImportSession] = useState<ImportSession | null>(
     null,
@@ -325,6 +368,9 @@ function CorporaPage({
   useEffect(() => {
     setOpen(openCreate);
   }, [openCreate]);
+  useEffect(() => {
+    setSplitFilter(initialSplit ?? "");
+  }, [initialSplit]);
   useEffect(() => {
     setExamplesLoading(true);
     setSelectedExample(null);
@@ -633,7 +679,8 @@ function CorporaPage({
     if (!window.confirm("Usunąć tę encję?")) return;
     setBusy(true);
     try {
-      await api.deleteExample(example.id);
+      const result = await api.deleteExample(example.id);
+      setLastDeletion({ trashId: result.trash_id, count: result.deleted });
       setExamples((current) =>
         current.filter((item) => item.id !== example.id),
       );
@@ -882,15 +929,26 @@ function CorporaPage({
     }
   }
   async function deleteSelected() {
+    const corpusNames = [
+      ...new Set(
+        examples
+          .filter((example) => selectedIds.has(example.id))
+          .map((example) => example.corpus_name ?? selectedCorpus?.name ?? "?"),
+      ),
+    ];
     if (
       !selectedIds.size ||
-      !window.confirm(`Usunąć zaznaczone encje: ${selectedIds.size}?`)
+      !window.confirm(
+        `Usunąć zaznaczone encje: ${selectedIds.size}?\nKorpus: ${corpusNames.join(", ")}\n\nUsunięcie można cofnąć przyciskiem „Cofnij”.`,
+      )
     )
       return;
     setBusy(true);
     try {
       const exampleIds = [...selectedIds];
-      await api.bulkDelete(exampleIds);
+      const result = await api.bulkDelete(exampleIds);
+      if (result.trash_id)
+        setLastDeletion({ trashId: result.trash_id, count: result.deleted });
       setExamples((current) =>
         current.filter((example) => !exampleIds.includes(example.id)),
       );
@@ -1029,6 +1087,28 @@ function CorporaPage({
         </div>
       }
     >
+      {lastDeletion && (
+        <div className="alert alert-warning d-flex justify-content-between align-items-center gap-2">
+          <span>Usunięto encje: {lastDeletion.count}.</span>
+          <span className="d-flex gap-2">
+            <button
+              className="btn btn-sm btn-warning"
+              type="button"
+              disabled={busy}
+              onClick={() => void undoDeletion()}
+            >
+              Cofnij
+            </button>
+            <button
+              className="btn btn-sm btn-outline-secondary"
+              type="button"
+              onClick={() => setLastDeletion(null)}
+            >
+              <X size={14} />
+            </button>
+          </span>
+        </div>
+      )}
       {importNotice && (
         <div className="alert alert-success">{importNotice}</div>
       )}
@@ -2415,6 +2495,34 @@ function Chat() {
   const [history, setHistory] = useState<Message[]>([]);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [systemPrompt, setSystemPrompt] = useState(
+    () => localStorage.getItem("chat-system-prompt") ?? "",
+  );
+  const [systemOpen, setSystemOpen] = useState(false);
+  const [systemNotice, setSystemNotice] = useState("");
+  useEffect(() => {
+    localStorage.setItem("chat-system-prompt", systemPrompt);
+  }, [systemPrompt]);
+  async function loadTrainingSystemPrompt() {
+    setSystemNotice("");
+    const counts = new Map<string, number>();
+    for (const example of await api.allExamples()) {
+      const system = example.messages.find(
+        (message) => message.role === "system",
+      );
+      if (system?.content.trim())
+        counts.set(system.content, (counts.get(system.content) ?? 0) + 1);
+    }
+    const [mostCommon] = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    if (!mostCommon) {
+      setSystemNotice("W ostatnich przykładach nie ma promptu systemowego.");
+      return;
+    }
+    setSystemPrompt(mostCommon[0]);
+    setSystemNotice(
+      `Wstawiono najczęstszy prompt systemowy (${mostCommon[1]} z ostatnich przykładów).`,
+    );
+  }
   useEffect(() => {
     api.models().then(({ models }) => {
       setModels(models);
@@ -2429,7 +2537,10 @@ function Chat() {
     setText("");
     setBusy(true);
     try {
-      await api.chatStream(next, model, (content) =>
+      const request = systemPrompt.trim()
+        ? [{ role: "system" as const, content: systemPrompt.trim() }, ...next]
+        : next;
+      await api.chatStream(request, model, (content) =>
         setHistory((current) =>
           current.map((message, index) =>
             index === current.length - 1
@@ -2457,6 +2568,59 @@ function Chat() {
           ))}
         </select>
       </div>
+      <div className="card shadow-sm border-0 mb-3">
+        <div className="card-body py-2">
+          <div className="d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <button
+              className="btn btn-link p-0 text-decoration-none d-flex align-items-center gap-1"
+              type="button"
+              onClick={() => setSystemOpen((open) => !open)}
+            >
+              {systemOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+              Prompt systemowy
+              {systemPrompt.trim() ? (
+                <span className="badge text-bg-success ms-1">aktywny</span>
+              ) : (
+                <span className="badge text-bg-secondary ms-1">brak</span>
+              )}
+            </button>
+            <div className="d-flex gap-2">
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                type="button"
+                onClick={() => {
+                  setSystemOpen(true);
+                  void loadTrainingSystemPrompt();
+                }}
+              >
+                Wstaw z danych treningowych
+              </button>
+              <button
+                className="btn btn-sm btn-outline-secondary"
+                type="button"
+                disabled={busy || !history.length}
+                onClick={() => setHistory([])}
+              >
+                <Trash2 size={14} className="me-1" /> Wyczyść rozmowę
+              </button>
+            </div>
+          </div>
+          {systemOpen && (
+            <>
+              <textarea
+                className="form-control mt-2"
+                rows={6}
+                value={systemPrompt}
+                onChange={(event) => setSystemPrompt(event.target.value)}
+                placeholder="Instrukcja systemowa wysyłana na początku każdej rozmowy"
+              />
+              {systemNotice && (
+                <p className="text-secondary small mt-1 mb-0">{systemNotice}</p>
+              )}
+            </>
+          )}
+        </div>
+      </div>
       <div className="card shadow-sm border-0">
         <div className="card-body chat-history">
           {history.map((message, index) => (
@@ -2472,6 +2636,17 @@ function Chat() {
             rows={4}
             value={text}
             onChange={(event) => setText(event.target.value)}
+            onKeyDown={(event) => {
+              if (
+                event.key === "Enter" &&
+                !event.shiftKey &&
+                !event.nativeEvent.isComposing
+              ) {
+                event.preventDefault();
+                if (!busy && model) event.currentTarget.form?.requestSubmit();
+              }
+            }}
+            placeholder="Enter wysyła, Shift+Enter nowa linia"
           />
           <button className="btn btn-primary mt-2" disabled={busy || !model}>
             <Send size={17} className="me-1" /> Wyślij
@@ -2503,17 +2678,39 @@ function formatMetric(value: number | undefined | null, digits = 4) {
     : value.toFixed(digits);
 }
 
+function logScaleTicks(min: number, max: number) {
+  const ticks: number[] = [];
+  for (
+    let exponent = Math.floor(Math.log10(min));
+    exponent <= Math.ceil(Math.log10(max));
+    exponent++
+  ) {
+    for (const base of [1, 2, 3, 5]) {
+      const value = base * 10 ** exponent;
+      if (value > min * 1.08 && value < max / 1.08) ticks.push(value);
+    }
+  }
+  return [min, ...ticks, max];
+}
+
 function LineChart({
   title,
   series,
   format,
+  height = 220,
+  width = 960,
+  scaleToggle = false,
+  xLabel = (value) => `krok ${value}`,
 }: {
   title: string;
   series: ChartSeries[];
   format: (value: number) => string;
+  height?: number;
+  width?: number;
+  scaleToggle?: boolean;
+  xLabel?: (value: number) => string;
 }) {
-  const width = 520;
-  const height = 200;
+  const [scale, setScale] = useState<"linear" | "progressive">("linear");
   const padding = { top: 12, right: 12, bottom: 24, left: 64 };
   const points = series.flatMap((item) => item.points);
   if (points.length < 2) {
@@ -2530,20 +2727,28 @@ function LineChart({
   const maxX = Math.max(...points.map((point) => point.x));
   const minY = Math.min(...points.map((point) => point.y));
   const maxY = Math.max(...points.map((point) => point.y));
+  const progressive = scale === "progressive" && minY > 0;
+  const transform = (y: number) => (progressive ? Math.log10(y) : y);
+  const lowY = transform(minY);
+  const highY = transform(maxY);
+  const ticks = progressive
+    ? logScaleTicks(minY, maxY)
+    : [minY, (minY + maxY) / 2, maxY];
   const scaleX = (x: number) =>
     padding.left +
     ((x - minX) / (maxX - minX || 1)) * (width - padding.left - padding.right);
   const scaleY = (y: number) =>
     height -
     padding.bottom -
-    ((y - minY) / (maxY - minY || 1)) * (height - padding.top - padding.bottom);
+    ((transform(y) - lowY) / (highY - lowY || 1)) *
+      (height - padding.top - padding.bottom);
   return (
     <div className="training-chart">
       <div className="d-flex justify-content-between align-items-baseline">
         <h3 className="h6 mb-1">{title}</h3>
-        <div className="d-flex gap-3 small">
+        <div className="d-flex align-items-center gap-3 small">
           {series
-            .filter((item) => item.points.length)
+            .filter((item) => series.length > 1 && item.points.length)
             .map((item) => (
               <span key={item.label}>
                 <span
@@ -2553,10 +2758,28 @@ function LineChart({
                 {item.label}
               </span>
             ))}
+          {scaleToggle && (
+            <div className="btn-group btn-group-sm" role="group">
+              <button
+                type="button"
+                className={`btn ${scale === "linear" ? "btn-secondary" : "btn-outline-secondary"}`}
+                onClick={() => setScale("linear")}
+              >
+                Liniowa
+              </button>
+              <button
+                type="button"
+                className={`btn ${scale === "progressive" ? "btn-secondary" : "btn-outline-secondary"}`}
+                onClick={() => setScale("progressive")}
+              >
+                Progresywna
+              </button>
+            </div>
+          )}
         </div>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="w-100" role="img">
-        {[minY, (minY + maxY) / 2, maxY].map((value) => (
+        {ticks.map((value) => (
           <g key={value}>
             <line
               x1={padding.left}
@@ -2577,7 +2800,7 @@ function LineChart({
           </g>
         ))}
         <text x={padding.left} y={height - 6} fontSize="11" fill="#6c757d">
-          krok {minX}
+          {xLabel(minX)}
         </text>
         <text
           x={width - padding.right}
@@ -2586,7 +2809,7 @@ function LineChart({
           fontSize="11"
           fill="#6c757d"
         >
-          krok {maxX}
+          {xLabel(maxX)}
         </text>
         {series.map((item) => (
           <g key={item.label}>
@@ -2617,7 +2840,13 @@ function LineChart({
 
 function metricSeries(
   metrics: TrainingMetric[],
-  key: "loss" | "eval_loss" | "learning_rate",
+  key:
+    | "loss"
+    | "eval_loss"
+    | "learning_rate"
+    | "mean_token_accuracy"
+    | "entropy"
+    | "grad_norm",
 ) {
   return metrics
     .filter((metric) => typeof metric[key] === "number")
@@ -2631,6 +2860,37 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
   const lossPoints = metricSeries(metrics, "loss");
   const evalPoints = metricSeries(metrics, "eval_loss");
   const learningRatePoints = metricSeries(metrics, "learning_rate");
+  const smallCharts: Array<{
+    title: string;
+    color: string;
+    points: Array<{ x: number; y: number }>;
+    format: (value: number) => string;
+  }> = [
+    {
+      title: "Learning rate",
+      color: "#3d6fb6",
+      points: learningRatePoints,
+      format: (value) => value.toExponential(1),
+    },
+    {
+      title: "Mean token accuracy",
+      color: "#176b61",
+      points: metricSeries(metrics, "mean_token_accuracy"),
+      format: (value) => `${(value * 100).toFixed(1)}%`,
+    },
+    {
+      title: "Entropy",
+      color: "#8e5bb5",
+      points: metricSeries(metrics, "entropy"),
+      format: (value) => value.toFixed(3),
+    },
+    {
+      title: "Grad norm",
+      color: "#c0503a",
+      points: metricSeries(metrics, "grad_norm"),
+      format: (value) => value.toFixed(3),
+    },
+  ];
   const step = last?.step ?? 0;
   const maxSteps = last?.max_steps ?? 0;
   const progress = maxSteps ? Math.min(100, (step / maxSteps) * 100) : 0;
@@ -2666,7 +2926,7 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
   return (
     <>
       <div className="row g-3 mt-2">
-        <div className="col-12 col-lg-4">
+        <div className="col-12 col-md-6 col-xxl-4">
           <div className="card shadow-sm border-0 h-100">
             <div className="card-body">
               <p className="text-secondary mb-1">Postęp</p>
@@ -2706,7 +2966,7 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
             </div>
           </div>
         </div>
-        <div className="col-12 col-lg-4">
+        <div className="col-12 col-md-6 col-xxl-4">
           <div className="card shadow-sm border-0 h-100">
             <div className="card-body">
               <p className="text-secondary mb-1">Learning rate (aktualny)</p>
@@ -2743,7 +3003,7 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
             </div>
           </div>
         </div>
-        <div className="col-12 col-lg-4">
+        <div className="col-12 col-md-6 col-xxl-4">
           <div className="card shadow-sm border-0 h-100">
             <div className="card-body">
               <p className="text-secondary mb-1">Loss (train)</p>
@@ -2764,30 +3024,38 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
       </div>
       <div className="card shadow-sm border-0 mt-4">
         <div className="card-body">
+          <LineChart
+            title="Loss"
+            height={270}
+            scaleToggle
+            format={(value) => value.toFixed(3)}
+            series={[
+              { label: "train", color: "#176b61", points: lossPoints },
+              { label: "eval", color: "#d9822b", points: evalPoints },
+            ]}
+          />
+        </div>
+      </div>
+      <div className="card shadow-sm border-0 mt-3">
+        <div className="card-body">
           <div className="row g-4">
-            <div className="col-12 col-xl-6">
-              <LineChart
-                title="Loss"
-                format={(value) => value.toFixed(3)}
-                series={[
-                  { label: "train", color: "#176b61", points: lossPoints },
-                  { label: "eval", color: "#d9822b", points: evalPoints },
-                ]}
-              />
-            </div>
-            <div className="col-12 col-xl-6">
-              <LineChart
-                title="Learning rate"
-                format={(value) => value.toExponential(1)}
-                series={[
-                  {
-                    label: "lr",
-                    color: "#3d6fb6",
-                    points: learningRatePoints,
-                  },
-                ]}
-              />
-            </div>
+            {smallCharts.map((chart) => (
+              <div className="col-12 col-md-6" key={chart.title}>
+                <LineChart
+                  title={chart.title}
+                  width={480}
+                  height={160}
+                  format={chart.format}
+                  series={[
+                    {
+                      label: chart.title,
+                      color: chart.color,
+                      points: chart.points,
+                    },
+                  ]}
+                />
+              </div>
+            ))}
           </div>
         </div>
       </div>
@@ -2795,23 +3063,572 @@ function TrainingDashboard({ status }: { status: TrainingStatus | null }) {
   );
 }
 
-function Training() {
+const LOG_TOKEN_PATTERN =
+  /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')(\s*:)?|(?<![\w.])(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)(?![\w.])|\b(True|False|None|null|true|false)\b/gi;
+
+function logLineClass(line: string) {
+  if (line.startsWith("BIELIK_METRIC")) return "log-metric";
+  if (/Traceback|Error|Exception|FAILED/.test(line)) return "log-error";
+  if (/warn|deprecated/i.test(line)) return "log-warning";
+  if (/\d+%\|/.test(line)) return "log-progress";
+  return "";
+}
+
+function highlightLogLine(line: string) {
+  const parts: ReactNode[] = [];
+  let last = 0;
+  for (const match of line.matchAll(LOG_TOKEN_PATTERN)) {
+    const index = match.index ?? 0;
+    if (index > last) parts.push(line.slice(last, index));
+    const [token, text, colon, number, literal] = match;
+    if (text) {
+      parts.push(
+        <span key={index} className={colon ? "log-key" : "log-string"}>
+          {text}
+        </span>,
+      );
+      if (colon) parts.push(colon);
+    } else if (number) {
+      parts.push(
+        <span key={index} className="log-number">
+          {number}
+        </span>,
+      );
+    } else if (literal) {
+      parts.push(
+        <span key={index} className="log-literal">
+          {literal}
+        </span>,
+      );
+    }
+    last = index + token.length;
+  }
+  if (last < line.length) parts.push(line.slice(last));
+  return parts;
+}
+
+function TrainingLogView({ logs }: { logs: string }) {
+  const lines = logs
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+    .split("\n")
+    .map((line) => {
+      const segments = line.split("\r").filter((segment) => segment.trim());
+      return segments.at(-1) ?? "";
+    });
+  return (
+    <pre className="training-logs mb-0">
+      {lines.map((line, index) => {
+        const lineClass = logLineClass(line);
+        return (
+          <div key={index} className={lineClass}>
+            {lineClass === "log-metric" ? (
+              <>
+                <span className="log-tag">BIELIK_METRIC</span>
+                {highlightLogLine(line.slice("BIELIK_METRIC".length))}
+              </>
+            ) : lineClass === "log-progress" || lineClass === "log-error" ? (
+              line
+            ) : (
+              highlightLogLine(line)
+            )}
+            {!line && "\u00a0"}
+          </div>
+        );
+      })}
+    </pre>
+  );
+}
+
+function checkpointLabel(checkpoint: string) {
+  return checkpoint === "base" ? "base (bez adaptera)" : checkpoint;
+}
+
+function DeploymentPanel({
+  adapters,
+  status,
+  gpuBusy,
+  onStatus,
+}: {
+  adapters: Record<string, string[]>;
+  status: ServingStatus | null;
+  gpuBusy: boolean;
+  onStatus: (status: ServingStatus) => void;
+}) {
+  const [adapter, setAdapter] = useState("");
+  const [checkpoint, setCheckpoint] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const adapterNames = Object.keys(adapters);
+  const selectedAdapter = adapter || adapterNames[0] || "";
+  const checkpoints = adapters[selectedAdapter] ?? [];
+  const selectedCheckpoint =
+    checkpoint && checkpoints.includes(checkpoint)
+      ? checkpoint
+      : (checkpoints.find((item) => item !== "base") ?? "");
+  const active = status?.state === "ready" || status?.state === "loading";
+  const isSelectedDeployed =
+    active &&
+    status?.adapter_name === selectedAdapter &&
+    status?.checkpoint === selectedCheckpoint;
+  const run = async (action: () => Promise<ServingStatus>) => {
+    setBusy(true);
+    setError("");
+    try {
+      onStatus(await action());
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : String(requestError),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  const deploy = () => {
+    if (
+      active &&
+      !window.confirm(
+        `Zastąpić wdrożony ${status?.model} checkpointem ${selectedAdapter}/${selectedCheckpoint}?`,
+      )
+    )
+      return;
+    void run(() => api.deployCheckpoint(selectedAdapter, selectedCheckpoint));
+  };
+  const badge = {
+    ready: ["text-bg-success", "Gotowy w czacie"],
+    loading: ["text-bg-info", "Ładowanie modelu…"],
+    failed: ["text-bg-danger", "Błąd wdrożenia"],
+    unavailable: ["text-bg-secondary", "Docker niedostępny"],
+    idle: ["text-bg-secondary", "Nic nie jest wdrożone"],
+  }[status?.state ?? "idle"];
+  return (
+    <div className="card shadow-sm border-0 mt-3">
+      <div className="card-body">
+        <div className="d-flex flex-wrap justify-content-between align-items-start gap-2">
+          <div>
+            <h2 className="h5 mb-1">Wdrożenie do czatu</h2>
+            <p className="text-secondary small mb-0">
+              Checkpoint z adapterem LoRA (4-bit NF4, jak w ewaluacji) pojawi
+              się w czacie Lokalny Bielik. Zajmuje GPU do czasu zatrzymania.
+            </p>
+          </div>
+          <span className={`badge ${badge[0]}`}>{badge[1]}</span>
+        </div>
+        {active && status?.model && (
+          <p className="small mt-2 mb-0">
+            Wdrożony: <code>{status.model}</code>
+            {status.state === "ready" && (
+              <>
+                {" · "}
+                <NavLink to="/chat">otwórz czat</NavLink>
+              </>
+            )}
+          </p>
+        )}
+        <div className="row g-2 align-items-end mt-1">
+          <div className="col-12 col-md-5">
+            <label className="form-label small mb-1" htmlFor="deploy-adapter">
+              Adapter
+            </label>
+            <select
+              id="deploy-adapter"
+              className="form-select"
+              value={selectedAdapter}
+              onChange={(event) => {
+                setAdapter(event.target.value);
+                setCheckpoint("");
+              }}
+            >
+              {adapterNames.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="col-12 col-md-4">
+            <label
+              className="form-label small mb-1"
+              htmlFor="deploy-checkpoint"
+            >
+              Checkpoint
+            </label>
+            <select
+              id="deploy-checkpoint"
+              className="form-select"
+              value={selectedCheckpoint}
+              onChange={(event) => setCheckpoint(event.target.value)}
+            >
+              {checkpoints.map((item) => (
+                <option key={item} value={item}>
+                  {checkpointLabel(item)}
+                  {active &&
+                  status?.adapter_name === selectedAdapter &&
+                  status?.checkpoint === item
+                    ? " — wdrożony"
+                    : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="col-12 col-md-3 d-flex gap-2">
+            <button
+              className="btn btn-primary flex-grow-1"
+              type="button"
+              onClick={deploy}
+              disabled={
+                busy || gpuBusy || !selectedCheckpoint || isSelectedDeployed
+              }
+            >
+              <Play size={16} className="me-1" /> Deploy checkpoint
+            </button>
+            <button
+              className="btn btn-outline-danger"
+              type="button"
+              title="Zatrzymaj wdrożenie"
+              onClick={() => void run(api.stopServing)}
+              disabled={busy || !status || status.state === "idle"}
+            >
+              <Square size={16} />
+            </button>
+          </div>
+        </div>
+        {gpuBusy && (
+          <p className="text-secondary small mt-2 mb-0">
+            GPU zajęte przez trening lub ewaluację — wdrożenie będzie możliwe po
+            ich zakończeniu.
+          </p>
+        )}
+        {status?.state === "failed" && (
+          <p className="text-danger small mt-2 mb-0">
+            Kontener wdrożenia zakończył się (kod {status.exit_code}). Szczegóły
+            w logach po prawej.
+          </p>
+        )}
+        {error && <p className="text-danger small mt-2 mb-0">{error}</p>}
+      </div>
+    </div>
+  );
+}
+
+function MetricBars({
+  title,
+  items,
+}: {
+  title: string;
+  items: Array<{ label: string; value: number | null; color: string }>;
+}) {
+  return (
+    <div className="training-chart">
+      <h3 className="h6 mb-2">{title}</h3>
+      {items.length === 0 && (
+        <p className="text-secondary small mb-0">Brak danych.</p>
+      )}
+      {items.map((item) => (
+        <div className="metric-bar" key={item.label}>
+          <span className="metric-bar-label" title={item.label}>
+            {item.label}
+          </span>
+          <span className="metric-bar-track">
+            <span
+              className="metric-bar-fill"
+              style={{
+                width: `${(item.value ?? 0) * 100}%`,
+                background: item.color,
+              }}
+            />
+          </span>
+          <span className="metric-bar-value">
+            {item.value == null ? "-" : `${(item.value * 100).toFixed(1)}%`}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CheckpointCharts({ result }: { result: EvaluationCheckpointResult }) {
+  const { summary, curve } = result;
+  const percent = (value: number) => `${(value * 100).toFixed(0)}%`;
+  const curveSeries = (
+    key: keyof EvaluationCurvePoint,
+    label: string,
+    color: string,
+  ) => ({
+    label,
+    color,
+    points: curve
+      .filter((point) => typeof point[key] === "number")
+      .map((point) => ({ x: point.n, y: point[key] as number })),
+  });
+  const perType = Object.entries(
+    summary?.per_type_relaxed ?? summary?.per_type ?? {},
+  );
+  const progress =
+    result.total && result.total > 0 ? (result.done / result.total) * 100 : 0;
+  return (
+    <div className="card shadow-sm border-0 mt-3">
+      <div className="card-body">
+        <div className="d-flex flex-wrap justify-content-between align-items-center gap-2">
+          <h2 className="h5 mb-0">{checkpointLabel(result.checkpoint)}</h2>
+          <span
+            className={`badge ${result.finished ? "text-bg-success" : result.done ? "text-bg-info" : "text-bg-secondary"}`}
+          >
+            {result.finished
+              ? "Zakończony"
+              : result.done
+                ? "W toku"
+                : "Oczekuje"}{" "}
+            · {result.done}/{result.total ?? "?"}
+          </span>
+        </div>
+        <div className="progress my-2" style={{ height: 6 }}>
+          <div
+            className={`progress-bar ${result.finished ? "" : "progress-bar-striped progress-bar-animated"}`}
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+        {!summary ? (
+          <p className="text-secondary small mb-0">
+            Wykresy pojawią się po pierwszych przykładach.
+          </p>
+        ) : (
+          <>
+            <dl className="training-stats mb-2">
+              <dt>Tolerancyjne F1</dt>
+              <dd>
+                {summary.relaxed.f1 == null ? "-" : percent(summary.relaxed.f1)}
+              </dd>
+              <dt>Ścisłe F1 (z pozycjami)</dt>
+              <dd>
+                {summary.strict.f1 == null ? "-" : percent(summary.strict.f1)}
+              </dd>
+              <dt>TP / FP / FN</dt>
+              <dd>
+                {summary.relaxed.tp} / {summary.relaxed.fp} /{" "}
+                {summary.relaxed.fn}
+              </dd>
+              <dt>Negatywne poprawnie</dt>
+              <dd>
+                {summary.negatives.correct}/{summary.negatives.examples}
+              </dd>
+            </dl>
+            <div className="row g-3">
+              <div className="col-12 col-xxl-6">
+                <LineChart
+                  title="Narastająco po przykładach"
+                  series={[
+                    curveSeries("relaxed_f1", "F1 tolerancyjne", "#176b61"),
+                    curveSeries("strict_f1", "F1 ścisłe", "#c0503a"),
+                    curveSeries("json_valid", "Poprawny JSON", "#8e5bb5"),
+                  ]}
+                  format={(value) => `${(value * 100).toFixed(0)}%`}
+                  xLabel={(value) => `przykład ${value}`}
+                  height={200}
+                  width={560}
+                />
+              </div>
+              <div className="col-12 col-xxl-6">
+                <MetricBars
+                  title="Precision / Recall / F1"
+                  items={[
+                    {
+                      label: "Tol. precision",
+                      value: summary.relaxed.precision,
+                      color: "#3d6fb6",
+                    },
+                    {
+                      label: "Tol. recall",
+                      value: summary.relaxed.recall,
+                      color: "#3d6fb6",
+                    },
+                    {
+                      label: "Tol. F1",
+                      value: summary.relaxed.f1,
+                      color: "#176b61",
+                    },
+                    {
+                      label: "Ścisłe precision",
+                      value: summary.strict.precision,
+                      color: "#c98a3a",
+                    },
+                    {
+                      label: "Ścisłe recall",
+                      value: summary.strict.recall,
+                      color: "#c98a3a",
+                    },
+                    {
+                      label: "Ścisłe F1",
+                      value: summary.strict.f1,
+                      color: "#c0503a",
+                    },
+                    {
+                      label: "Poprawny JSON",
+                      value: summary.json_valid,
+                      color: "#8e5bb5",
+                    },
+                    {
+                      label: "Komplet encji",
+                      value: summary.exact_match,
+                      color: "#8e5bb5",
+                    },
+                  ]}
+                />
+              </div>
+              <div className="col-12">
+                <MetricBars
+                  title="F1 według typu encji (tolerancyjne)"
+                  items={perType.map(([type, score]) => ({
+                    label: `${type} (${score.tp + score.fn})`,
+                    value: score.f1,
+                    color: "#176b61",
+                  }))}
+                />
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EvaluationComparison({
+  comparison,
+}: {
+  comparison: Array<EvaluationSummary & { checkpoint: string }>;
+}) {
+  if (comparison.length < 2) return null;
+  const pointLabel = (position: number) =>
+    checkpointLabel(comparison[position - 1]?.checkpoint ?? "checkpoint");
+  return (
+    <div className="row g-3 mt-1">
+      <div className="col-12 col-xl-6">
+        <LineChart
+          title="F1 checkpointów"
+          series={[
+            {
+              label: "Ścisła F1",
+              color: "#176b61",
+              points: comparison.map((result, index) => ({
+                x: index + 1,
+                y: result.strict.f1 ?? 0,
+              })),
+            },
+            {
+              label: "Tolerancyjna F1",
+              color: "#3d6fb6",
+              points: comparison.map((result, index) => ({
+                x: index + 1,
+                y: result.relaxed.f1 ?? 0,
+              })),
+            },
+          ]}
+          format={(value) => `${(value * 100).toFixed(1)}%`}
+          xLabel={pointLabel}
+          height={210}
+          width={580}
+        />
+      </div>
+      <div className="col-12 col-xl-6">
+        <LineChart
+          title="Format odpowiedzi"
+          series={[
+            {
+              label: "Poprawny JSON",
+              color: "#8e5bb5",
+              points: comparison.map((result, index) => ({
+                x: index + 1,
+                y: result.json_valid ?? 0,
+              })),
+            },
+            {
+              label: "Komplet encji",
+              color: "#c0503a",
+              points: comparison.map((result, index) => ({
+                x: index + 1,
+                y: result.exact_match ?? 0,
+              })),
+            },
+          ]}
+          format={(value) => `${(value * 100).toFixed(1)}%`}
+          xLabel={pointLabel}
+          height={210}
+          width={580}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
   const [status, setStatus] = useState<TrainingStatus | null>(null);
+  const [evaluationStatus, setEvaluationStatus] =
+    useState<EvaluationStatus | null>(null);
+  const [evaluationAdapters, setEvaluationAdapters] = useState<
+    Record<string, string[]>
+  >({});
   const [corpora, setCorpora] = useState<Corpus[]>([]);
   const [baseModels, setBaseModels] = useState<string[]>([]);
   const [corpusId, setCorpusId] = useState("");
   const [baseModel, setBaseModel] = useState("");
   const [adapterName, setAdapterName] = useState("bielik-qlora-v1");
+  const [evaluationAdapter, setEvaluationAdapter] = useState("");
+  const [evaluationCheckpoints, setEvaluationCheckpoints] = useState<string[]>(
+    [],
+  );
+  const [evaluationSplits, setEvaluationSplits] = useState<Array<Split>>([
+    "test",
+  ]);
+  const trainingPageRef = useRef<HTMLElement>(null);
+  const [logsWidth, setLogsWidth] = useState(
+    () => Number(localStorage.getItem("training-logs-width")) || 640,
+  );
+  const resizeLogs = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const bounds = trainingPageRef.current?.getBoundingClientRect();
+    if (!bounds || !event.currentTarget.hasPointerCapture(event.pointerId))
+      return;
+    const width = Math.round(
+      Math.min(Math.max(bounds.right - event.clientX, 280), bounds.width - 420),
+    );
+    setLogsWidth(width);
+    localStorage.setItem("training-logs-width", String(width));
+  };
   const [busy, setBusy] = useState(false);
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
   const [error, setError] = useState("");
+  const [evaluationError, setEvaluationError] = useState("");
+  const [runs, setRuns] = useState<TrainingRunSummary[]>([]);
+  const [runId, setRunId] = useState("");
+  const [viewedRun, setViewedRun] = useState<TrainingStatus | null>(null);
+  useEffect(() => {
+    if (!runId) {
+      setViewedRun(null);
+      return;
+    }
+    void api.trainingRun(runId).then(setViewedRun);
+  }, [runId]);
+  useEffect(() => {
+    void api.trainingRuns().then(setRuns);
+  }, [status?.state]);
+  const [servingStatus, setServingStatus] = useState<ServingStatus | null>(
+    null,
+  );
   const refresh = () =>
-    api
-      .trainingStatus()
-      .then(setStatus)
+    Promise.all([
+      api.trainingStatus(corpusId),
+      api.evaluationStatus(),
+      api.servingStatus(),
+    ])
+      .then(([training, evaluation, serving]) => {
+        setStatus(training);
+        setEvaluationStatus(evaluation);
+        setServingStatus(serving);
+      })
       .catch((requestError: Error) => setError(requestError.message));
 
   useEffect(() => {
-    void refresh();
     void api.corpora().then((items) => {
       setCorpora(items);
       setCorpusId((current) => current || items[0]?.id || "");
@@ -2820,9 +3637,18 @@ function Training() {
       setBaseModels(models);
       setBaseModel((current) => current || models[0] || "");
     });
+    void api.evaluationAdapters().then(({ adapters }) => {
+      setEvaluationAdapters(adapters);
+      const firstAdapter = Object.keys(adapters)[0] || "";
+      setEvaluationAdapter(firstAdapter);
+      setEvaluationCheckpoints(adapters[firstAdapter]?.slice(0, 2) || []);
+    });
+  }, []);
+  useEffect(() => {
+    void refresh();
     const interval = window.setInterval(() => void refresh(), 4000);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [corpusId]);
 
   const start = async () => {
     setBusy(true);
@@ -2856,141 +3682,615 @@ function Training() {
     }
   };
 
+  const selectEvaluationAdapter = (nextAdapter: string) => {
+    setEvaluationAdapter(nextAdapter);
+    setEvaluationCheckpoints(
+      evaluationAdapters[nextAdapter]?.slice(0, 2) || [],
+    );
+  };
+
+  const toggleCheckpoint = (checkpoint: string) => {
+    setEvaluationCheckpoints((current) =>
+      current.includes(checkpoint)
+        ? current.filter((item) => item !== checkpoint)
+        : [...current, checkpoint],
+    );
+  };
+
+  const toggleEvaluationSplit = (split: Split) => {
+    setEvaluationSplits((current) =>
+      current.includes(split)
+        ? current.filter((item) => item !== split)
+        : [...current, split],
+    );
+  };
+
+  const startEvaluation = async () => {
+    setEvaluationBusy(true);
+    setEvaluationError("");
+    try {
+      setEvaluationStatus(
+        await api.startEvaluation(
+          corpusId,
+          evaluationAdapter,
+          evaluationCheckpoints,
+          evaluationSplits,
+        ),
+      );
+    } catch (requestError) {
+      setEvaluationError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Nie udało się uruchomić ewaluacji.",
+      );
+    } finally {
+      setEvaluationBusy(false);
+    }
+  };
+
+  const stopEvaluation = async () => {
+    if (
+      !window.confirm(
+        "Zatrzymać ewaluację? Niezakończone checkpointy trzeba będzie liczyć od nowa.",
+      )
+    )
+      return;
+    setEvaluationBusy(true);
+    setEvaluationError("");
+    try {
+      setEvaluationStatus(await api.stopEvaluation());
+    } catch (requestError) {
+      setEvaluationError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Nie udało się zatrzymać ewaluacji.",
+      );
+    } finally {
+      setEvaluationBusy(false);
+    }
+  };
+
   const splits = status?.splits;
   const isRunning = status?.state === "running";
+  const isEvaluationRunning = evaluationStatus?.state === "running";
+  const checkpointEvals = (status?.metrics ?? [])
+    .filter((metric) => typeof metric.eval_loss === "number")
+    .map((metric) => ({
+      step: metric.step,
+      evalLoss: metric.eval_loss as number,
+      accuracy: metric.eval_mean_token_accuracy,
+    }));
+  const bestCheckpoint = checkpointEvals.reduce<
+    (typeof checkpointEvals)[number] | undefined
+  >(
+    (best, item) => (!best || item.evalLoss < best.evalLoss ? item : best),
+    undefined,
+  );
+  // Live, rescored results; comparison.json keeps whatever metric version wrote it.
+  const comparison = (evaluationStatus?.checkpoints ?? []).flatMap((result) =>
+    result.finished && result.summary
+      ? [{ ...result.summary, checkpoint: result.checkpoint }]
+      : [],
+  );
+  const summary = comparison.at(-1) ?? evaluationStatus?.summary;
+  const evaluationStopped =
+    evaluationStatus?.state === "exited" &&
+    // 143 = SIGTERM, e.g. `docker stop` outside the UI.
+    (Boolean(evaluationStatus.stopped) || evaluationStatus.exit_code === 143);
+  const evaluationFailed =
+    evaluationStatus?.state === "exited" &&
+    Boolean(evaluationStatus.exit_code) &&
+    !evaluationStopped;
+  const evaluationLabel = isEvaluationRunning
+    ? "Ewaluacja w toku"
+    : evaluationStopped
+      ? "Zatrzymana ręcznie"
+      : evaluationFailed
+        ? "Ewaluacja zakończona błędem"
+        : comparison.length
+          ? "Wyniki gotowe"
+          : "Gotowa do uruchomienia";
+  const formatPercent = (value: number | null | undefined) =>
+    value == null ? "-" : `${(value * 100).toFixed(1)}%`;
   return (
-    <section className="workspace-page medium-page">
-      <p className="section-kicker">QLORA</p>
-      <h1>Uczenie i status</h1>
-      <div className="row g-3 mt-2">
-        {(["train", "validation", "test"] as Split[]).map((split) => (
-          <div className="col-12 col-md-4" key={split}>
-            <div className="card shadow-sm border-0">
-              <div className="card-body">
-                <p className="text-secondary mb-1">{split}</p>
-                <div className="display-6">{splits?.[split] ?? "-"}</div>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-      <div className="card shadow-sm border-0 mt-4">
-        <div className="card-body">
-          <div className="row g-3">
-            <div className="col-12 col-md-6">
-              <label className="form-label" htmlFor="training-corpus">
-                Korpus
-              </label>
-              <select
-                id="training-corpus"
-                className="form-select"
-                value={corpusId}
-                onChange={(event) => setCorpusId(event.target.value)}
-                disabled={isRunning}
-              >
-                <option value="">Wybierz korpus</option>
-                {corpora.map((corpus) => (
-                  <option key={corpus.id} value={corpus.id}>
-                    {corpus.name} ({corpus.example_count})
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="col-12 col-md-6">
-              <label className="form-label" htmlFor="training-model">
-                Model bazowy
-              </label>
-              <select
-                id="training-model"
-                className="form-select"
-                value={baseModel}
-                onChange={(event) => setBaseModel(event.target.value)}
-                disabled={isRunning}
-              >
-                {baseModels.map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="col-12">
-              <label className="form-label" htmlFor="adapter-name">
-                Nazwa adaptera
-              </label>
-              <input
-                id="adapter-name"
-                className="form-control"
-                value={adapterName}
-                onChange={(event) =>
-                  setAdapterName(
-                    event.target.value
-                      .toLowerCase()
-                      .replace(/[^a-z0-9-]/g, "-"),
-                  )
-                }
-                disabled={isRunning}
-              />
-            </div>
-          </div>
-          <span
-            className={`badge ${isRunning ? "text-bg-success" : "text-bg-secondary"}`}
-          >
-            {status?.state ?? "loading"}
-          </span>
-          <div className="d-flex flex-wrap gap-2 mt-3">
-            <button
-              className="btn btn-primary"
-              onClick={() => void start()}
-              disabled={
-                busy ||
-                isRunning ||
-                !corpusId ||
-                !baseModel ||
-                adapterName.length < 2
-              }
-            >
-              <Play size={16} className="me-1" /> Eksportuj i rozpocznij
-            </button>
-            <button
-              className="btn btn-outline-danger"
-              onClick={() => void stop()}
-              disabled={busy || !isRunning}
-            >
-              <Square size={16} className="me-1" /> Zatrzymaj
-            </button>
-            <button
-              className="btn btn-outline-secondary"
-              onClick={() => void refresh()}
-              disabled={busy}
-            >
-              <RefreshCw size={16} className="me-1" /> Odśwież
-            </button>
-          </div>
-          {error && <p className="text-danger small mt-3 mb-0">{error}</p>}
-          <h2 className="h5 mt-4">Profil QLoRA</h2>
-          <code>{status?.profile ?? "profil QLoRA"}</code>
-          <p className="text-secondary small mt-3 mb-0">
-            Uczony jest nowy adapter LoRA, nie model bazowy. Eksport obejmuje
-            tylko wybrany korpus i jego splity <code>train</code> oraz{" "}
-            <code>validation</code>.
+    <section
+      className={`training-page ${evaluationOnly ? "validation-page" : ""}`}
+      ref={trainingPageRef}
+      style={{ gridTemplateColumns: `minmax(0, 1fr) 6px ${logsWidth}px` }}
+    >
+      <div className="training-main">
+        <p className="section-kicker">
+          {evaluationOnly ? "EWALUACJA" : "QLORA"}
+        </p>
+        <h1>
+          {evaluationOnly ? "Ewaluacja checkpointów" : "Uczenie i status"}
+        </h1>
+        {evaluationOnly && (
+          <p className="text-secondary mb-3">
+            Porównaj zapisane checkpointy na oznaczonych przykładach bez
+            uruchamiania treningu.
           </p>
-          {status?.job?.adapter_name && (
-            <p className="text-secondary small mt-2 mb-0">
-              Ostatnie zadanie: <code>{status.job.base_model}</code> do adaptera{" "}
-              <code>{status.job.adapter_name}</code>.
-            </p>
-          )}
-        </div>
+        )}
+        {evaluationOnly && (
+          <DeploymentPanel
+            adapters={evaluationAdapters}
+            status={servingStatus}
+            gpuBusy={isRunning || isEvaluationRunning}
+            onStatus={setServingStatus}
+          />
+        )}
+        {!evaluationOnly && (
+          <div className="card shadow-sm border-0 mt-3">
+            <div className="card-body">
+              <div className="row g-3">
+                <div className="col-12">
+                  <label className="form-label" htmlFor="adapter-name">
+                    Nazwa adaptera
+                  </label>
+                  <input
+                    id="adapter-name"
+                    className="form-control"
+                    value={adapterName}
+                    onChange={(event) =>
+                      setAdapterName(
+                        event.target.value
+                          .toLowerCase()
+                          .replace(/[^a-z0-9-]/g, "-"),
+                      )
+                    }
+                    disabled={isRunning}
+                  />
+                </div>
+                <div className="col-12 col-md-6">
+                  <label className="form-label" htmlFor="training-corpus">
+                    Korpus
+                  </label>
+                  <select
+                    id="training-corpus"
+                    className="form-select"
+                    value={corpusId}
+                    onChange={(event) => setCorpusId(event.target.value)}
+                    disabled={isRunning}
+                  >
+                    <option value="">Wybierz korpus</option>
+                    {corpora.map((corpus) => (
+                      <option key={corpus.id} value={corpus.id}>
+                        {corpus.name} ({corpus.example_count})
+                      </option>
+                    ))}
+                  </select>
+                  {corpusId && (
+                    <div className="form-text">
+                      {(["train", "validation", "test"] as Split[])
+                        .map((split) => `${split}: ${splits?.[split] ?? "-"}`)
+                        .join(" · ")}
+                    </div>
+                  )}
+                </div>
+                <div className="col-12 col-md-6">
+                  <label className="form-label" htmlFor="training-model">
+                    Model bazowy
+                  </label>
+                  <select
+                    id="training-model"
+                    className="form-select"
+                    value={baseModel}
+                    onChange={(event) => setBaseModel(event.target.value)}
+                    disabled={isRunning}
+                  >
+                    {baseModels.map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <span
+                className={`badge ${isRunning ? "text-bg-success" : "text-bg-secondary"}`}
+              >
+                {status?.state ?? "loading"}
+              </span>
+              <div className="d-flex flex-wrap gap-2 mt-3">
+                <button
+                  className="btn btn-primary"
+                  onClick={() => void start()}
+                  disabled={
+                    busy ||
+                    isRunning ||
+                    !corpusId ||
+                    !baseModel ||
+                    adapterName.length < 2
+                  }
+                >
+                  <Play size={16} className="me-1" /> Rozpocznij uczenie
+                </button>
+                <button
+                  className="btn btn-outline-danger"
+                  onClick={() => void stop()}
+                  disabled={busy || !isRunning}
+                >
+                  <Square size={16} className="me-1" /> Zatrzymaj
+                </button>
+                <button
+                  className="btn btn-outline-secondary"
+                  onClick={() => void refresh()}
+                  disabled={busy}
+                >
+                  <RefreshCw size={16} className="me-1" /> Odśwież
+                </button>
+              </div>
+              {error && <p className="text-danger small mt-3 mb-0">{error}</p>}
+              <h2 className="h5 mt-4">Profil QLoRA</h2>
+              <code>{status?.profile ?? "profil QLoRA"}</code>
+              <p className="text-secondary small mt-3 mb-0">
+                Uczony jest nowy adapter LoRA, nie model bazowy. Eksport
+                obejmuje tylko wybrany korpus i jego splity <code>train</code>{" "}
+                oraz <code>validation</code>.
+              </p>
+              {status?.job?.adapter_name && (
+                <p className="text-secondary small mt-2 mb-0">
+                  Ostatnie zadanie: <code>{status.job.base_model}</code> do
+                  adaptera <code>{status.job.adapter_name}</code>.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+        {evaluationOnly && (
+          <div className="card shadow-sm border-0 mt-3">
+            <div className="card-body">
+              <div className="d-flex flex-wrap justify-content-between align-items-start gap-2">
+                <div>
+                  <h2 className="h5 mb-1">Porównanie checkpointów</h2>
+                  <p className="text-secondary small mb-0">
+                    Generowanie na wybranym splicie bez zmiany adaptera.
+                  </p>
+                </div>
+                <span
+                  className={`badge ${isEvaluationRunning ? "text-bg-info" : "text-bg-secondary"}`}
+                >
+                  {evaluationLabel}
+                </span>
+              </div>
+              {checkpointEvals.length > 0 && (
+                <div className="row g-3 mt-1">
+                  <div className="col-12 col-xl-7">
+                    <LineChart
+                      title="Eval loss checkpointów"
+                      series={[
+                        {
+                          label: "eval_loss",
+                          color: "#c0503a",
+                          points: checkpointEvals.map((item) => ({
+                            x: item.step,
+                            y: item.evalLoss,
+                          })),
+                        },
+                      ]}
+                      format={(value) => value.toFixed(4)}
+                      height={210}
+                      width={580}
+                    />
+                  </div>
+                  <div className="col-12 col-xl-5">
+                    <table className="table table-sm align-middle mb-0">
+                      <thead>
+                        <tr>
+                          <th>Krok</th>
+                          <th>eval_loss</th>
+                          <th>Token acc.</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {checkpointEvals.map((item) => (
+                          <tr
+                            key={item.step}
+                            className={
+                              item.step === bestCheckpoint?.step
+                                ? "table-success fw-semibold"
+                                : ""
+                            }
+                          >
+                            <td>
+                              checkpoint-{item.step}
+                              {item.step === bestCheckpoint?.step &&
+                                " (najlepszy)"}
+                            </td>
+                            <td>{item.evalLoss.toFixed(4)}</td>
+                            <td>{formatPercent(item.accuracy)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              <div className="row g-3 mt-1">
+                <div className="col-12">
+                  <label className="form-label" htmlFor="evaluation-corpus">
+                    Korpus
+                  </label>
+                  <select
+                    id="evaluation-corpus"
+                    className="form-select"
+                    value={corpusId}
+                    onChange={(event) => setCorpusId(event.target.value)}
+                    disabled={isEvaluationRunning}
+                  >
+                    <option value="">Wybierz korpus</option>
+                    {corpora.map((corpus) => (
+                      <option key={corpus.id} value={corpus.id}>
+                        {corpus.name} ({corpus.example_count})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="col-12 col-md-6">
+                  <label className="form-label" htmlFor="evaluation-adapter">
+                    Adapter
+                  </label>
+                  <select
+                    id="evaluation-adapter"
+                    className="form-select"
+                    value={evaluationAdapter}
+                    onChange={(event) =>
+                      selectEvaluationAdapter(event.target.value)
+                    }
+                    disabled={isRunning || isEvaluationRunning}
+                  >
+                    <option value="">Wybierz adapter</option>
+                    {Object.keys(evaluationAdapters).map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="col-12 col-md-6">
+                  <span className="form-label d-block mb-1">
+                    Checkpointy do porównania
+                  </span>
+                  {(evaluationAdapters[evaluationAdapter] || []).map(
+                    (checkpoint) => (
+                      <div className="form-check" key={checkpoint}>
+                        <input
+                          id={`evaluation-checkpoint-${checkpoint}`}
+                          className="form-check-input"
+                          type="checkbox"
+                          checked={evaluationCheckpoints.includes(checkpoint)}
+                          onChange={() => toggleCheckpoint(checkpoint)}
+                          disabled={isRunning || isEvaluationRunning}
+                        />
+                        <label
+                          className="form-check-label"
+                          htmlFor={`evaluation-checkpoint-${checkpoint}`}
+                        >
+                          {checkpointLabel(checkpoint)}
+                          {servingStatus?.adapter_name === evaluationAdapter &&
+                            servingStatus.checkpoint === checkpoint &&
+                            ["ready", "loading"].includes(
+                              servingStatus.state,
+                            ) && (
+                              <span className="badge text-bg-success ms-2">
+                                wdrożony
+                              </span>
+                            )}
+                        </label>
+                      </div>
+                    ),
+                  )}
+                </div>
+                <div className="col-12">
+                  <span className="form-label d-block mb-1">Dane do oceny</span>
+                  {(["train", "validation", "test"] as const).map((split) => (
+                    <div className="form-check form-check-inline" key={split}>
+                      <input
+                        id={`evaluation-${split}`}
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={evaluationSplits.includes(split)}
+                        onChange={() => toggleEvaluationSplit(split)}
+                        disabled={isRunning || isEvaluationRunning}
+                      />
+                      <label
+                        className="form-check-label"
+                        htmlFor={`evaluation-${split}`}
+                      >
+                        {split} ({splits?.[split] ?? 0})
+                      </label>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="d-flex flex-wrap gap-2 mt-3">
+                <button
+                  className="btn btn-primary"
+                  onClick={() => void startEvaluation()}
+                  disabled={
+                    evaluationBusy ||
+                    isRunning ||
+                    isEvaluationRunning ||
+                    !corpusId ||
+                    !evaluationAdapter ||
+                    evaluationCheckpoints.length === 0 ||
+                    evaluationSplits.length === 0
+                  }
+                >
+                  <Play size={16} className="me-1" /> Uruchom ewaluację
+                </button>
+                <button
+                  className="btn btn-outline-danger"
+                  onClick={() => void stopEvaluation()}
+                  disabled={evaluationBusy || !isEvaluationRunning}
+                >
+                  <Square size={16} className="me-1" /> Zatrzymaj
+                </button>
+              </div>
+              {evaluationStatus?.progress && (
+                <p className="text-secondary small mt-3 mb-0">
+                  Postęp
+                  {evaluationStatus.progress.checkpoint &&
+                    ` (${evaluationStatus.progress.checkpoint})`}
+                  : {evaluationStatus.progress.done} /{" "}
+                  {evaluationStatus.progress.total}
+                  {evaluationStatus.progress.elapsed > 0 &&
+                    ` · ${Math.round(evaluationStatus.progress.elapsed)} s`}
+                </p>
+              )}
+              {evaluationError && (
+                <p className="text-danger small mt-3 mb-0">{evaluationError}</p>
+              )}
+              {evaluationStopped && (
+                <p className="text-secondary small mt-3 mb-0">
+                  Ewaluacja zatrzymana przyciskiem Zatrzymaj.
+                </p>
+              )}
+              {evaluationFailed && (
+                <p className="text-danger small mt-3 mb-0">
+                  Ewaluacja przerwana (kod wyjścia {evaluationStatus?.exit_code}
+                  ). Szczegóły w logach po prawej.
+                </p>
+              )}
+              {!isEvaluationRunning &&
+                !evaluationFailed &&
+                !summary &&
+                comparison.length === 0 && (
+                  <p className="text-secondary small mt-3 mb-0">
+                    Brak wyników porównania. Zaznacz checkpointy i uruchom
+                    ewaluację, aby zobaczyć wykresy oraz tabelę wyników.
+                  </p>
+                )}
+              {summary && (
+                <div className="table-responsive mt-3">
+                  <table className="table table-sm align-middle mb-0">
+                    <thead>
+                      <tr>
+                        <th>Próba</th>
+                        <th>Precision</th>
+                        <th>Recall</th>
+                        <th>F1</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <th>Ścisła</th>
+                        <td>{formatPercent(summary.strict.precision)}</td>
+                        <td>{formatPercent(summary.strict.recall)}</td>
+                        <td>{formatPercent(summary.strict.f1)}</td>
+                      </tr>
+                      <tr>
+                        <th>Tolerancyjna</th>
+                        <td>{formatPercent(summary.relaxed.precision)}</td>
+                        <td>{formatPercent(summary.relaxed.recall)}</td>
+                        <td>{formatPercent(summary.relaxed.f1)}</td>
+                      </tr>
+                      <tr>
+                        <th>Format odpowiedzi</th>
+                        <td>JSON: {formatPercent(summary.json_valid)}</td>
+                        <td>
+                          Komplet encji: {formatPercent(summary.exact_match)}
+                        </td>
+                        <td>
+                          Negatywne: {summary.negatives.correct}/
+                          {summary.negatives.examples}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <EvaluationComparison comparison={comparison} />
+              {comparison.length > 0 && (
+                <div className="table-responsive mt-3">
+                  <table className="table table-sm align-middle mb-0">
+                    <thead>
+                      <tr>
+                        <th>Checkpoint</th>
+                        <th>Ścisła F1</th>
+                        <th>Tolerancyjna F1</th>
+                        <th>JSON</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {comparison.map((result) => (
+                        <tr key={result.checkpoint}>
+                          <th>{checkpointLabel(result.checkpoint)}</th>
+                          <td>{formatPercent(result.strict.f1)}</td>
+                          <td>{formatPercent(result.relaxed.f1)}</td>
+                          <td>{formatPercent(result.json_valid)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        {evaluationOnly &&
+          evaluationStatus?.checkpoints?.map((result) => (
+            <CheckpointCharts key={result.checkpoint} result={result} />
+          ))}
+        {!evaluationOnly && (
+          <div className="d-flex flex-wrap align-items-center gap-2 mt-3">
+            <label className="form-label mb-0" htmlFor="training-run">
+              Run
+            </label>
+            <select
+              id="training-run"
+              className="form-select w-auto"
+              value={runId}
+              onChange={(event) => setRunId(event.target.value)}
+            >
+              <option value="">Bieżący ({status?.state ?? "…"})</option>
+              {runs.map((run) => (
+                <option key={run.run_id} value={run.run_id}>
+                  {run.started_at
+                    ? new Date(run.started_at).toLocaleString("pl-PL")
+                    : run.run_id}{" "}
+                  · {run.adapter_name} · {run.steps} kroków
+                  {run.best_eval_loss != null &&
+                    ` · min eval_loss ${run.best_eval_loss.toFixed(4)}`}
+                  {run.exit_code ? ` · kod ${run.exit_code}` : ""}
+                </option>
+              ))}
+            </select>
+            {viewedRun && (
+              <span className="badge text-bg-secondary">
+                Archiwum — {viewedRun.job?.adapter_name}
+              </span>
+            )}
+          </div>
+        )}
+        {!evaluationOnly && <TrainingDashboard status={viewedRun ?? status} />}
       </div>
-      <TrainingDashboard status={status} />
-      <div className="card shadow-sm border-0 mt-4">
-        <div className="card-body">
-          <h2 className="h5">Logi zadania</h2>
-          <pre className="training-logs mb-0">
-            {status?.logs || "Brak logów zadania."}
-          </pre>
-        </div>
+      <div
+        className="training-splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Zmień szerokość panelu logów"
+        onPointerDown={(event) =>
+          event.currentTarget.setPointerCapture(event.pointerId)
+        }
+        onPointerMove={resizeLogs}
+        onDoubleClick={() => {
+          setLogsWidth(640);
+          localStorage.removeItem("training-logs-width");
+        }}
+      />
+      <div className="training-logs-column">
+        <TrainingLogView
+          logs={
+            (evaluationOnly
+              ? !isEvaluationRunning &&
+                servingStatus &&
+                ["loading", "ready", "failed"].includes(servingStatus.state)
+                ? servingStatus.logs
+                : evaluationStatus?.logs
+              : (viewedRun ?? status)?.logs) || "Brak logów zadania."
+          }
+        />
       </div>
     </section>
   );
@@ -2998,17 +4298,23 @@ function Training() {
 
 function Workspace() {
   const [corpora, setCorpora] = useState<Corpus[]>([]);
+  const pathname = useLocation().pathname;
+  const showSidebar = !["/training", "/evaluation"].some((path) =>
+    pathname.startsWith(path),
+  );
   const refresh = () => api.corpora().then(setCorpora);
   useEffect(() => {
     void refresh();
   }, []);
   return (
-    <main className="workspace-shell">
+    <main className={`workspace-shell ${showSidebar ? "" : "no-sidebar"}`}>
       <header className="workspace-header">
         <Bot size={21} /> Bielik LoRA Lab{" "}
         <nav className="workspace-header-nav">
+          <NavLink to="/corpora">Korpusy</NavLink>
           <NavLink to="/chat">Lokalny Bielik</NavLink>
           <NavLink to="/training">Uczenie</NavLink>
+          <NavLink to="/evaluation">Ewaluacja</NavLink>
         </nav>
         <button
           className="btn btn-sm btn-outline-light"
@@ -3017,26 +4323,28 @@ function Workspace() {
           <RefreshCw size={15} />
         </button>
       </header>
-      <aside className="corpus-sidebar">
-        <div className="sidebar-title">
-          <Database size={16} /> KORPUSY
-        </div>
-        <NavLink className="btn btn-primary w-100 mb-3" to="/corpora/new">
-          <FilePlus2 size={17} className="me-1" /> Nowy korpus
-        </NavLink>
-        <nav>
-          {corpora.map((corpus) => (
-            <NavLink
-              className="corpus-link"
-              key={corpus.id}
-              to={`/corpora/${corpus.id}`}
-            >
-              <span>{corpus.name}</span>
-              <small>{corpus.example_count}</small>
-            </NavLink>
-          ))}
-        </nav>
-      </aside>
+      {showSidebar && (
+        <aside className="corpus-sidebar">
+          <div className="sidebar-title">
+            <Database size={16} /> KORPUSY
+          </div>
+          <NavLink className="btn btn-primary w-100 mb-3" to="/corpora/new">
+            <FilePlus2 size={17} className="me-1" /> Nowy korpus
+          </NavLink>
+          <nav>
+            {corpora.map((corpus) => (
+              <NavLink
+                className="corpus-link"
+                key={corpus.id}
+                to={`/corpora/${corpus.id}`}
+              >
+                <span>{corpus.name}</span>
+                <small>{corpus.example_count}</small>
+              </NavLink>
+            ))}
+          </nav>
+        </aside>
+      )}
       <section className="content-area">
         <Routes>
           <Route
@@ -3077,11 +4385,16 @@ function Workspace() {
             }
           />
           <Route
+            path="/validation"
+            element={<Navigate to="/evaluation" replace />}
+          />
+          <Route
             path="/builder/:corpusId?"
             element={<Builder corpora={corpora} />}
           />
           <Route path="/chat" element={<Chat />} />
           <Route path="/training" element={<Training />} />
+          <Route path="/evaluation" element={<Training evaluationOnly />} />
           <Route path="*" element={<Navigate to="/corpora" replace />} />
         </Routes>
       </section>

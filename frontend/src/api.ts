@@ -57,8 +57,11 @@ export type TrainingMetric = {
   num_train_epochs?: number;
   loss?: number;
   eval_loss?: number;
+  eval_mean_token_accuracy?: number;
   learning_rate?: number;
   grad_norm?: number;
+  mean_token_accuracy?: number;
+  entropy?: number;
   train_loss?: number;
   train_runtime?: number;
 };
@@ -95,10 +98,91 @@ export type TrainingStatus = {
   };
 };
 
+export type TrainingRunSummary = {
+  run_id: string;
+  adapter_name: string;
+  started_at: string | null;
+  finished_at: string | null;
+  exit_code: number | null;
+  steps: number;
+  best_eval_loss: number | null;
+};
+
 export type TrainingStart = {
   corpusId: string;
   baseModel: string;
   adapterName: string;
+};
+
+export type EvaluationScore = {
+  tp: number;
+  fp: number;
+  fn: number;
+  precision: number | null;
+  recall: number | null;
+  f1: number | null;
+};
+
+export type EvaluationSummary = {
+  examples: number;
+  json_valid: number | null;
+  exact_match: number | null;
+  strict: EvaluationScore;
+  relaxed: EvaluationScore;
+  per_type: Record<string, EvaluationScore>;
+  per_type_relaxed?: Record<string, EvaluationScore>;
+  negatives: { examples: number; correct: number };
+};
+
+export type EvaluationCurvePoint = {
+  n: number;
+  json_valid: number;
+  strict_precision: number | null;
+  strict_recall: number | null;
+  strict_f1: number | null;
+  relaxed_precision: number | null;
+  relaxed_recall: number | null;
+  relaxed_f1: number | null;
+};
+
+export type EvaluationCheckpointResult = {
+  checkpoint: string;
+  done: number;
+  total: number | null;
+  finished: boolean;
+  summary: EvaluationSummary | null;
+  curve: EvaluationCurvePoint[];
+};
+
+export type EvaluationStatus = {
+  state: string;
+  exit_code?: number | null;
+  stopped?: boolean;
+  progress: {
+    checkpoint?: string;
+    done: number;
+    total: number;
+    elapsed: number;
+  } | null;
+  summary: EvaluationSummary | null;
+  comparison?: Array<EvaluationSummary & { checkpoint: string }>;
+  checkpoints?: EvaluationCheckpointResult[];
+  output?: string | null;
+  adapter_name?: string | null;
+  checkpoint?: string | null;
+  splits?: string | null;
+  logs: string;
+  error?: string;
+};
+
+export type ServingStatus = {
+  state: "idle" | "loading" | "ready" | "failed" | "unavailable";
+  adapter_name?: string;
+  checkpoint?: string;
+  model?: string;
+  logs?: string;
+  error?: string | null;
+  exit_code?: number | null;
 };
 
 export type ExampleReview = {
@@ -208,12 +292,15 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(example),
     }),
-  deleteExample: async (exampleId: string) => {
-    const response = await fetch(`/api/examples/${exampleId}`, {
-      method: "DELETE",
-    });
-    if (!response.ok) throw new Error("Nie udało się usunąć encji.");
-  },
+  deleteExample: (exampleId: string) =>
+    request<{ deleted: number; trash_id: string }>(
+      `/api/examples/${exampleId}`,
+      { method: "DELETE" },
+    ),
+  restoreTrash: (trashId: string) =>
+    request<{ restored: number }>(`/api/trash/${trashId}/restore`, {
+      method: "POST",
+    }),
   bulkSetFlag: (exampleIds: string[], flag: ExampleFlag) =>
     request<{ updated: number }>("/api/examples/bulk/flag", {
       method: "POST",
@@ -246,10 +333,13 @@ export const api = {
       },
     ),
   bulkDelete: (exampleIds: string[]) =>
-    request<{ deleted: number }>("/api/examples/bulk/delete", {
-      method: "POST",
-      body: JSON.stringify({ example_ids: exampleIds }),
-    }),
+    request<{ deleted: number; trash_id: string | null }>(
+      "/api/examples/bulk/delete",
+      {
+        method: "POST",
+        body: JSON.stringify({ example_ids: exampleIds }),
+      },
+    ),
   bulkClassify: (exampleIds: string[]) =>
     request<{ classified: number; needs_review: number; missing: number }>(
       "/api/examples/bulk/classify",
@@ -280,8 +370,14 @@ export const api = {
       body: JSON.stringify({ messages }),
     }),
   models: () => request<{ models: string[] }>("/api/models"),
-  trainingStatus: () => request<TrainingStatus>("/api/training/status"),
+  trainingStatus: (corpusId?: string) =>
+    request<TrainingStatus>(
+      `/api/training/status${corpusId ? `?corpus_id=${encodeURIComponent(corpusId)}` : ""}`,
+    ),
   trainingModels: () => request<{ models: string[] }>("/api/training/models"),
+  trainingRuns: () => request<TrainingRunSummary[]>("/api/training/runs"),
+  trainingRun: (runId: string) =>
+    request<TrainingStatus>(`/api/training/runs/${encodeURIComponent(runId)}`),
   startTraining: ({ corpusId, baseModel, adapterName }: TrainingStart) =>
     request<TrainingStatus>("/api/training/start", {
       method: "POST",
@@ -293,6 +389,34 @@ export const api = {
     }),
   stopTraining: () =>
     request<TrainingStatus>("/api/training/stop", { method: "POST" }),
+  evaluationAdapters: () =>
+    request<{ adapters: Record<string, string[]> }>("/api/evaluation/adapters"),
+  evaluationStatus: () => request<EvaluationStatus>("/api/evaluation/status"),
+  startEvaluation: (
+    corpusId: string,
+    adapterName: string,
+    checkpoints: string[],
+    splits: Array<"train" | "validation" | "test">,
+  ) =>
+    request<EvaluationStatus>("/api/evaluation/start", {
+      method: "POST",
+      body: JSON.stringify({
+        corpus_id: corpusId,
+        adapter_name: adapterName,
+        checkpoints,
+        splits,
+      }),
+    }),
+  stopEvaluation: () =>
+    request<EvaluationStatus>("/api/evaluation/stop", { method: "POST" }),
+  servingStatus: () => request<ServingStatus>("/api/serving/status"),
+  deployCheckpoint: (adapterName: string, checkpoint: string) =>
+    request<ServingStatus>("/api/serving/deploy", {
+      method: "POST",
+      body: JSON.stringify({ adapter_name: adapterName, checkpoint }),
+    }),
+  stopServing: () =>
+    request<ServingStatus>("/api/serving/stop", { method: "POST" }),
   chatStream: async (
     messages: Message[],
     model: string,

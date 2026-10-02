@@ -17,6 +17,7 @@ body { min-width: 320px; background: #eef2ee; }
 @media (max-width: 575.98px) { .app-navbar .navbar-brand { font-size: 1rem; }.app-navbar .nav-link { font-size: 0; }.app-navbar .nav-link svg { margin: 0 !important; }.app-content { padding-top: 1.25rem !important; } }
 
 .workspace-shell { display: grid; grid-template-columns: 260px minmax(0, 1fr); grid-template-rows: 56px minmax(0, 1fr); min-height: 100vh; background: #eef2ee; }
+.workspace-shell.no-sidebar { grid-template-columns: minmax(0, 1fr); }
 .workspace-header { grid-column: 1 / -1; display: flex; align-items: center; gap: .6rem; padding: 0 1rem; color: #fff; font-weight: 700; background: #164f4a; }
 .workspace-header-nav { display: flex; align-items: center; gap: .25rem; margin-left: auto; }
 .workspace-header-nav a { padding: .35rem .55rem; color: rgb(255 255 255 / 74%); text-decoration: none; font-size: .85rem; font-weight: 500; }
@@ -37,10 +38,35 @@ body { min-width: 320px; background: #eef2ee; }
 .export-control { width: 15rem; }
 .message-panel { padding: 0; }
 .message-textarea { border-top-left-radius: 0; border-top-right-radius: 0; }
-.model-select { width: min(18rem, 55vw); }
-.training-logs { min-height: 28rem; max-height: 48rem; margin: 0; padding: 1rem; overflow: auto; border-radius: .375rem; color: #d7f4e8; background: #172724; font-size: .8rem; white-space: pre-wrap; }.training-stats { display: grid; grid-template-columns: auto 1fr; gap: .2rem 1rem; font-size: .875rem; }
+.model-select { width: min(28rem, 60vw); }
+.training-logs { min-height: 28rem; max-height: 48rem; margin: 0; padding: 1rem; overflow: auto; border-radius: .375rem; color: #d7f4e8; background: #172724; font-size: .8rem; white-space: pre-wrap; }
+.training-page { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); height: calc(100vh - 56px); overflow: hidden; }
+.training-main { min-height: 0; padding: 2rem; overflow-y: auto; }
+.training-logs-column { min-height: 0; background: #172724; }
+.training-logs .log-progress { color: #6f8a82; }
+.training-logs .log-error { color: #ff8a80; }
+.training-logs .log-warning { color: #ffd479; }
+.training-logs .log-tag { color: #172724; background: #7fd8b8; padding: 0 .3rem; border-radius: 2px; font-weight: 700; }
+.training-logs .log-key { color: #8cc8ff; }
+.training-logs .log-string { color: #c3e88d; }
+.training-logs .log-number { color: #f7a26b; }
+.training-logs .log-literal { color: #c792ea; }
+.training-splitter { cursor: col-resize; background: #d3ddd7; touch-action: none; transition: background .15s; }
+.training-splitter:hover, .training-splitter:active { background: #176b61; }
+.training-logs-column .training-logs { height: 100%; min-height: 0; max-height: none; border-radius: 0; }
+@media (max-width: 1199.98px) {
+  .training-page { display: block; height: auto; overflow: visible; }
+  .training-splitter { display: none; }
+  .training-logs-column { height: calc(100vh - 56px); }
+}
+.training-stats { display: grid; grid-template-columns: auto 1fr; gap: .2rem 1rem; font-size: .875rem; }
 .training-stats dt { font-weight: 400; color: #6c757d; }
 .training-stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.metric-bar { display: grid; grid-template-columns: minmax(8rem, 14rem) 1fr 3.5rem; align-items: center; gap: .6rem; margin-bottom: .35rem; font-size: .8rem; }
+.metric-bar-label { overflow: hidden; color: #4f5b62; white-space: nowrap; text-overflow: ellipsis; }
+.metric-bar-track { height: .6rem; overflow: hidden; border-radius: 1rem; background: #e7ece9; }
+.metric-bar-fill { display: block; height: 100%; border-radius: 1rem; }
+.metric-bar-value { text-align: right; font-variant-numeric: tabular-nums; }
 .training-chart-swatch { display: inline-block; width: .75rem; height: .2rem; margin-right: .3rem; vertical-align: middle; border-radius: 1px; }.chat-history { min-height: 50vh; display: grid; align-content: start; gap: 1rem; }
 .chat-message { max-width: 85%; padding: .85rem 1rem; border-radius: .375rem; background: #edf2ef; }
 .chat-message.user { justify-self: end; color: #fff; background: #176b61; }

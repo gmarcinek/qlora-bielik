@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from bielik_lora.corpus import export_jsonl, import_jsonl, initialize_database
+from bielik_lora.evaluation import evaluate_adapter, evaluate_checkpoints
 from bielik_lora.ollama import generate
 from bielik_lora.training import evaluate, merge_adapter, train, write_ollama_modelfile
 
@@ -30,6 +31,28 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("train", "evaluate"):
         command = commands.add_parser(name)
         command.add_argument("--config", type=Path, default=Path("configs/qlora.yaml"))
+    evaluation = commands.add_parser(
+        "evaluate-adapter", help="Score adapter generations against reference JSON answers"
+    )
+    evaluation.add_argument("--base-model", required=True)
+    evaluation.add_argument("--adapter", type=Path, required=True)
+    evaluation.add_argument("--data", type=Path, required=True)
+    evaluation.add_argument("--output", type=Path, required=True)
+    evaluation.add_argument("--max-new-tokens", type=int, default=2048)
+    comparison = commands.add_parser(
+        "evaluate-checkpoints", help="Compare selected adapter checkpoints against reference JSON answers"
+    )
+    comparison.add_argument("--base-model", required=True)
+    comparison.add_argument("--adapter-root", type=Path, required=True)
+    comparison.add_argument("--checkpoints", nargs="+", required=True)
+    comparison.add_argument("--data", type=Path, required=True)
+    comparison.add_argument("--output", type=Path, required=True)
+    comparison.add_argument("--max-new-tokens", type=int, default=2048)
+    serving = commands.add_parser("serve-adapter", help="Serve chat completions from a LoRA checkpoint")
+    serving.add_argument("--base-model", required=True)
+    serving.add_argument("--adapter", type=Path)
+    serving.add_argument("--name", required=True)
+    serving.add_argument("--port", type=int, default=8080)
     adapter = commands.add_parser("adapter", help="Prepare a trained adapter for local deployment")
     adapter_commands = adapter.add_subparsers(dest="adapter_command", required=True)
     merge = adapter_commands.add_parser("merge", help="Merge a PEFT adapter into the base model")
@@ -56,6 +79,27 @@ def main() -> None:
         train(arguments.config)
     elif arguments.command == "evaluate":
         print(evaluate(arguments.config))
+    elif arguments.command == "evaluate-adapter":
+        evaluate_adapter(
+            arguments.base_model,
+            arguments.adapter,
+            arguments.data,
+            arguments.output,
+            arguments.max_new_tokens,
+        )
+    elif arguments.command == "evaluate-checkpoints":
+        evaluate_checkpoints(
+            arguments.base_model,
+            arguments.adapter_root,
+            arguments.checkpoints,
+            arguments.data,
+            arguments.output,
+            arguments.max_new_tokens,
+        )
+    elif arguments.command == "serve-adapter":
+        from bielik_lora.serving import serve
+
+        serve(arguments.base_model, arguments.adapter, arguments.name, arguments.port)
     elif arguments.command == "adapter" and arguments.adapter_command == "merge":
         merge_adapter(arguments.base_model, arguments.adapter, arguments.output)
     elif arguments.command == "adapter" and arguments.adapter_command == "modelfile":
