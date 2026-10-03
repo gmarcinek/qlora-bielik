@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <changeSet id="004-agent-conversations" author="bielik-lab">
+        <comment>Corpus assistant conversations; id is the UUID of the conversation's sandbox session folder.</comment>
+        <sql splitStatements="true"> CREATE TABLE agent_conversations ( id UUID PRIMARY KEY,
+            corpus_id UUID NOT NULL REFERENCES corpora(id) ON DELETE CASCADE, title TEXT, events
+            JSONB NOT NULL DEFAULT '[]'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now() ); CREATE INDEX
+            agent_conversations_corpus_idx ON agent_conversations (corpus_id, updated_at DESC); </sql>
+        <rollback> DROP TABLE IF EXISTS agent_conversations; </rollback>
+    </changeSet>
+</databaseChangeLog>

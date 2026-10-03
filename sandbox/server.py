@@ -37,6 +37,11 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/sessions")
+def list_sessions() -> list[dict[str, Any]]:
+    return workspace.sessions()
+
+
 @app.post("/sessions/{session_id}/open")
 def open_session(session_id: str, meta: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
     return workspace.session(session_id).open(meta)
@@ -50,6 +55,11 @@ def close_session(session_id: str) -> dict[str, Any]:
 @app.get("/sessions/{session_id}")
 def session_info(session_id: str) -> dict[str, Any]:
     return workspace.session(session_id).info()
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: str) -> dict[str, Any]:
+    return workspace.session(session_id).delete()
 
 
 @app.post("/sessions/{session_id}/tools/{name}")

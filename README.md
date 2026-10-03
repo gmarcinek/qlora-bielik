@@ -24,6 +24,53 @@ npm run dev
 
 Vite udostepnia GUI na `http://localhost:5173` i przekazuje `/api` do `http://localhost:8000`. Gdy Compose juz zajmuje port `5173`, zatrzymaj usluge `frontend` albo uruchom `npm run dev -- --port 5174`.
 
+Widok `#/corpora` to galeria korpusow z dwoma kafelkami w rzedzie (jednym na
+malym ekranie), nazwa, opisem oraz liczba przykladow (i propozycji, jesli API
+udostepnia ich liczbe). Przycisk
+`Nowy korpus` znajduje sie nad galeria, bez panelu bocznego.
+Po otwarciu korpusu lewy panel zawiera historie czatow i przycisk `Nowy czat`,
+srodek zachowuje narzedzia korpusu, a prawy panel sluzy do rozmowy z asystentem.
+Rozmowy sa zapisywane w PostgreSQL (tabela `agent_conversations`, migracja
+`004`). UUID rozmowy jest nazwa jej folderu w `artifacts/sandbox` i fragmentem
+adresu `#/corpora/<korpus>/chats/<rozmowa>`, wiec rozmowe mozna otworzyc z URL.
+Nowy czat trafia do bazy przy pierwszej wiadomosci albo zalaczniku. Usuniecie
+rozmowy z listy usuwa tez jej folder sandboksa; usuniecie korpusu przenosi jego
+rozmowy do kosza (foldery zostaja, wiec przywrocenie korpusu je odzyskuje).
+Starsze foldery sandboksa z przypisanym korpusem pojawiaja sie na liscie jako
+rozmowy bez historii, a rozmowy zapisane wczesniej w przegladarce sa jednorazowo
+przenoszone do bazy.
+
+### Asystent korpusu: orkiestrator, generatory, analityk
+
+Asystent w czacie jest orkiestratorem: rozmawia, ustala intencje uzytkownika,
+planuje i zleca prace wykonawcom, a sam robi tylko drobne poprawki. Narzedzia
+maja poziomy:
+
+- agenci (top): orkiestrator, `generate_examples` (zespol generatorow, do 5
+  rownolegle) i `analyze_series` (analityk serii),
+- domenowe (medium): narzedzia korpusu i propozycji oraz czytelnik duzych plikow,
+- ogolne (low): sandbox i pliki, dostepne dla kazdego agenta,
+- prywatne: `save_examples` generatora oraz `remove_proposals` i
+  `regenerate_proposals` analityka; orkiestrator ich nie widzi.
+
+Orkiestrator prowadzi stan sprawy (`update_plan`: intencja, plan krokow,
+ustalenia, decyzje, otwarte pytania, serie). Stan jest zapisany przy rozmowie
+(`agent_conversations.state`, migracja `005`) i wraca do niego w kazdej turze;
+serie i odhaczanie krokow generacji i analizy zapisuje system. Kolejnosc pracy:
+zrozumienie (odczyt plikow, przeglad korpusu, intencja), generatory, analityk,
+raport. Generator dostaje intencje, cel, tryb treningu (SFT albo DPO), kontekst,
+opcje, wytyczne i dane (zakresy plikow do przeczytania albo material), sam czyta
+zrodla i zapisuje przyklady do Propozycji paczkami po 20-30 (jedna partia na
+serie). W trybie DPO kazdy przyklad ma tez odpowiedz odrzucona
+(`metadata.rejected`), widoczna w zakladce Pary DPO i eksporcie DPO. Analityk
+usuwa duplikaty i przyklady nienadajace sie do korpusu oraz sam zleca
+generatorom regeneracje i runy balansujace. Orkiestrator dostaje tylko skrot:
+ile dodano lub usunieto, proporcje i manifest. Wskazane przyklady asystent
+pobiera po id (`get_examples`) i edytuje bezposrednio: zaakceptowane
+`update_examples` (poprzednia wersja trafia do `data/revisions`, nad lista jest
+"Cofnij"), oczekujace propozycje `update_proposals`. Prompty sa w
+`prompts/orkiestrator.yml` i `prompts/generator.yml`.
+
 Trening QLoRA jest osobnym profilem z dostepem do GPU:
 
 ```powershell

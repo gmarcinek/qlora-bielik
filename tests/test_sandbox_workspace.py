@@ -99,3 +99,16 @@ def test_shell_and_script(session):
     result = session.run_script("import sys; print(sys.argv[1])", args=["x"])
     assert result["stdout"].strip() == "x" and result["script"] == "scripts/script-001.py"
     assert session.shell("sleep 5", timeout_seconds=1)["timed_out"]
+
+
+def test_sessions_list_metadata_and_delete_removes_folder(session, tmp_path):
+    workspace = Workspace(tmp_path / "sessions")
+    (tmp_path / "sessions" / "not-a-session").mkdir()
+    session.write_file("work/a.txt", "x")
+    assert [item["id"] for item in workspace.sessions()] == [session.id]
+    assert workspace.sessions()[0]["meta"] == {"corpus": "test"}
+    assert session.delete() == {"id": session.id, "deleted": True}
+    assert not session.path.exists() and workspace.sessions() == []
+    with pytest.raises(SandboxError) as error:
+        session.delete()
+    assert error.value.status == 404

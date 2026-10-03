@@ -6,4 +6,6 @@
     <include file="001-initial-schema.xml" relativeToChangelogFile="true" />
     <include file="002-corpus-settings.xml" relativeToChangelogFile="true" />
     <include file="003-unassigned-split.xml" relativeToChangelogFile="true" />
+    <include file="004-agent-conversations.xml" relativeToChangelogFile="true" />
+    <include file="005-conversation-state.xml" relativeToChangelogFile="true" />
 </databaseChangeLog>

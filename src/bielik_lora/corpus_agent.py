@@ -321,6 +321,81 @@ TOOLS += [
             },
         },
     },
+    {
+        "name": "get_examples",
+        "description": (
+            "Pełne przykłady po id — zaakceptowane przykłady korpusu (train/validation/test) i oczekujące propozycje: status, split, "
+            "flaga, instrukcja systemowa, wymiany. Użyj, gdy użytkownik lub analiza wskazuje konkretne id (np. z kontroli jakości)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 100}},
+            "required": ["ids"],
+            "additionalProperties": False,
+        },
+        "returns": {
+            "type": "object",
+            "required": ["examples", "unknown"],
+            "properties": {
+                "examples": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "status", "split", "flag", "user", "assistant"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "status": {"type": "string", "description": "corpus (zaakceptowany) albo proposal (oczekująca propozycja)."},
+                            "split": {"type": "string"},
+                            "flag": {"type": "string"},
+                            "user": {"type": "string"},
+                            "assistant": {"type": "string"},
+                        },
+                    },
+                },
+                "unknown": {"type": "array"},
+            },
+        },
+    },
+    {
+        "name": "update_examples",
+        "description": (
+            "Edytuje zaakceptowane przykłady korpusu po id (maks. 20 na wywołanie) — bezpośrednio, bez propozycji. Podaj tylko "
+            "zmieniane pola (system, user, assistant, followup, flag, task, split); reszta zostaje. Wynik przechodzi te same kontrole "
+            "co propozycje (format, flaga, słownik, duplikat). Poprzednia wersja jest zapisywana — użytkownik może cofnąć zmianę. "
+            "Najpierw obejrzyj przykłady get_examples. Dla oczekujących propozycji użyj update_proposals."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "updates": {
+                    "type": "array",
+                    "maxItems": MAX_PROPOSALS_PER_CALL,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            **PROPOSAL_EXAMPLE_PROPERTIES,
+                            "flag": {"type": "string", "enum": ["positive", "negative", "unclassified"]},
+                        },
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["updates"],
+            "additionalProperties": False,
+        },
+        "returns": {
+            "type": "object",
+            "required": ["updated", "rejected"],
+            "properties": {
+                "updated": {"type": "integer"},
+                "written": {"type": "integer", "description": "Faktycznie zapisane w bazie."},
+                "revision": {"type": ["string", "null"], "description": "Zapisana poprzednia wersja (do cofnięcia przez użytkownika)."},
+                "rejected": {"type": "array"},
+            },
+        },
+    },
 ]
 
 
@@ -424,6 +499,10 @@ class CorpusAgentTools:
             return self.reject_proposals(arguments.get("ids") or [])
         if name == "park_examples":
             return self.park_examples(arguments.get("ids") or [])
+        if name == "get_examples":
+            return self.get_examples(arguments.get("ids") or []), None
+        if name == "update_examples":
+            return self.update_examples(arguments.get("updates") or [])
         raise ToolError("unknown_tool", f"Nieznane narzędzie {name}.")
 
     def balance(self, detail: str = "summary") -> dict[str, Any]:
@@ -604,7 +683,17 @@ class CorpusAgentTools:
         for index, update in enumerate(updates[:MAX_PROPOSALS_PER_CALL]):
             row = by_id.get(str(update.get("id")))
             if row is None:
-                rejected.append({"index": index, "reason": f"Nie ma oczekującej propozycji {update.get('id')}."})
+                corpus_ids = {str(item["id"]) for item in self.rows}
+                rejected.append(
+                    {
+                        "index": index,
+                        "reason": (
+                            f"{update.get('id')} to zaakceptowany przykład korpusu — edytuj go update_examples."
+                            if str(update.get("id")) in corpus_ids
+                            else f"Nie ma oczekującej propozycji {update.get('id')}."
+                        ),
+                    }
+                )
                 continue
             current = self.proposal_view(row)
             example = {**current, **{key: value for key, value in update.items() if key != "id"}}
@@ -667,6 +756,69 @@ class CorpusAgentTools:
         self.rows = [row for row in self.rows if str(row["id"]) not in parked]
         result = {"moved": len(parked), "unknown": [item for item in ids if str(item) not in known]}
         return result, ({"type": "examples_parked", "ids": parked} if parked else None)
+
+    def get_examples(self, ids: list[str]) -> dict[str, Any]:
+        rows = {str(row["id"]): ("corpus", row) for row in self.rows}
+        rows.update({str(row["id"]): ("proposal", row) for row in self.pending})
+        examples: list[dict[str, Any]] = []
+        used = 0
+        for key in dict.fromkeys(str(item) for item in ids):
+            if key not in rows:
+                continue
+            status, row = rows[key]
+            view = {**self.proposal_view(row), "status": status, "flag": row.get("flag") or "unclassified"}
+            used += len(json.dumps(view, ensure_ascii=False))
+            if examples and used > CONTEXT_LIMIT_CHARS:
+                break
+            examples.append(view)
+        return {"examples": examples, "unknown": [str(item) for item in ids if str(item) not in rows]}
+
+    def update_examples(self, updates: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Direct edits of accepted corpus examples; same checks as proposals, the caller keeps the previous version."""
+        by_id = {str(row["id"]): row for row in self.rows}
+        pending_ids = {str(row["id"]) for row in self.pending}
+        changed: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        for index, update in enumerate(updates[:MAX_PROPOSALS_PER_CALL]):
+            key = str(update.get("id"))
+            row = by_id.get(key)
+            if row is None:
+                reason = (
+                    f"{key} to oczekująca propozycja — edytuj ją update_proposals."
+                    if key in pending_ids
+                    else f"Nie ma zaakceptowanego przykładu {key} w tym korpusie (train/validation/test)."
+                )
+                rejected.append({"index": index, "reason": reason})
+                continue
+            current = {**self.proposal_view(row), "flag": row.get("flag") or "unclassified"}
+            example = {**current, **{name: value for name, value in update.items() if name != "id"}}
+            if not isinstance(example.get("followup"), dict):
+                example.pop("followup", None)
+            example = self.limit_exchanges(example, index, warnings)
+            original_user = current["user"].strip()
+            self.known_users.discard(original_user)
+            reason = self.validate(example)
+            if reason:
+                self.known_users.add(original_user)
+                rejected.append({"index": index, "reason": reason})
+                continue
+            exchanges = [
+                {"user": str(item["user"]).strip(), "assistant": normalized_answer(str(item["assistant"]))}
+                for item in exchanges_of(example)
+            ]
+            draft = {"system": str(example.get("system") or "").strip(), **exchanges[0], "turns": exchanges[1:]}
+            self.known_users.add(exchanges[0]["user"])
+            split = example.get("split") or row["split"]
+            if split != row["split"]:
+                self.split_counts[row["split"]] -= 1
+                self.split_counts[split] += 1
+            row.update(messages=draft_messages(draft), flag=example["flag"], split=split, task=example.get("task") or row.get("task"))
+            changed.append({"id": key, "messages": row["messages"], "flag": row["flag"], "split": split, "task": row["task"]})
+            if warning := self.missing_keys_warning(example):
+                warnings.append({"index": index, "warning": warning})
+        result = {"updated": len(changed), "rejected": rejected, **({"warnings": warnings} if warnings else {})}
+        return result, ({"type": "example_updates", "updated": changed} if changed else None)
 
     def validate(self, example: dict[str, Any]) -> str | None:
         exchanges = exchanges_of(example)

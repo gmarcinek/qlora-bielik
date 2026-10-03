@@ -28,10 +28,19 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 import yaml
 
-from bielik_lora.agent import CONTEXT_LIMIT_CHARS, run_agent
+from bielik_lora.agent import CONTEXT_LIMIT_CHARS, ToolError, run_agent
 from bielik_lora.corpus_agent import TOOLS as AGENT_TOOLS
 from bielik_lora.corpus_agent import CorpusAgentTools, draft_messages
 from bielik_lora.corpus_analysis import analyze as analyze_corpus, example_issues
+from bielik_lora.generation import (
+    ANALYZE_SERIES_TOOL,
+    GENERATE_EXAMPLES_TOOL,
+    GeneralTools,
+    analyze_series_session,
+    generate_examples_session,
+)
+from bielik_lora.orchestration import MAX_NOTES as MAX_SERIES
+from bielik_lora.orchestration import PLAN_TOOL, plan_event, record_series, render_state, update_plan
 from bielik_lora.prompts import orchestrator_prompts
 from bielik_lora.sandbox_client import SANDBOX_TOOL_NAMES, SANDBOX_TOOLS, SandboxClient
 from bielik_lora.large_reader import READ_LARGE_FILE_TOOL, read_large_file_session
@@ -177,6 +186,18 @@ class AgentChat(BaseModel):
         if total > CONTEXT_LIMIT_CHARS:
             raise ValueError(f"Rozmowa ma {total} znaków, limit kontekstu to {CONTEXT_LIMIT_CHARS}.")
         return self
+
+
+class AgentLogItem(BaseModel):
+    kind: Literal["user", "assistant", "tool", "error"]
+    text: str = Field(max_length=CONTEXT_LIMIT_CHARS)
+
+
+class ConversationCreate(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    # Transcript kept by older UI versions in the browser; imported once as display-only log events.
+    legacy_log: list[AgentLogItem] = Field(default_factory=list, max_length=20000)
+    created_at: datetime | None = None
 
 
 class ExportStart(BaseModel):
@@ -1926,7 +1947,14 @@ def delete_corpus(corpus_id: UUID, request: Request) -> dict:
             ids = [row["id"] for row in database_connection.execute(
                 "SELECT id FROM training_examples WHERE corpus_id = %s", (corpus_id,)
             ).fetchall()]
-            deleted, trash_id = delete_to_trash(database_connection, ids, corpus=corpus)
+            conversations = database_connection.execute(
+                """
+                SELECT id, corpus_id, title, events, created_at, updated_at
+                FROM agent_conversations WHERE corpus_id = %s
+                """,
+                (corpus_id,),
+            ).fetchall()
+            deleted, trash_id = delete_to_trash(database_connection, ids, corpus=corpus, conversations=conversations)
             database_connection.execute("DELETE FROM corpora WHERE id = %s", (corpus_id,))
     return {"deleted": deleted, "trash_id": trash_id, "name": corpus["name"]}
 
@@ -1941,7 +1969,48 @@ def list_examples(corpus_id: UUID, request: Request) -> list[dict]:
             """,
             (corpus_id,),
         )
-        return list(result.fetchall())
+        active = active_series()
+        return [{**row, "locked": (row["metadata"] or {}).get("import_id") in active} for row in result.fetchall()]
+
+
+# Proposal batches agents are working on right now (generators or analyst during an orchestrator turn).
+# The user cannot accept, edit or delete them until the turn ends; in-memory, so a restart never leaves stale locks.
+ACTIVE_SERIES_LOCK = threading.Lock()
+ACTIVE_SERIES: dict[str, int] = {}
+
+
+def lock_series(batch: str) -> None:
+    with ACTIVE_SERIES_LOCK:
+        ACTIVE_SERIES[batch] = ACTIVE_SERIES.get(batch, 0) + 1
+
+
+def release_series(batch: str) -> None:
+    with ACTIVE_SERIES_LOCK:
+        if ACTIVE_SERIES.get(batch, 0) <= 1:
+            ACTIVE_SERIES.pop(batch, None)
+        else:
+            ACTIVE_SERIES[batch] -= 1
+
+
+def active_series() -> set[str]:
+    with ACTIVE_SERIES_LOCK:
+        return set(ACTIVE_SERIES)
+
+
+def ensure_unlocked(request: Request, example_ids: list[UUID]) -> None:
+    active = active_series()
+    if not active or not example_ids:
+        return
+    with request.app.state.pool.connection() as database_connection:
+        locked = database_connection.execute(
+            "SELECT count(*) AS locked FROM training_examples WHERE id = ANY(%s::uuid[]) AND metadata->>'import_id' = ANY(%s)",
+            ([str(item) for item in example_ids], list(active)),
+        ).fetchone()["locked"]
+    if locked:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Propozycje w pracy agentów ({locked}) — poczekaj, aż asystent skończy turę.",
+        )
 
 
 @app.get("/api/examples")
@@ -2095,6 +2164,7 @@ def paraphrase_selected_text_endpoint(payload: SelectedTextParaphrase) -> dict[s
 
 @app.post("/api/examples/bulk/flag")
 def bulk_set_flag(payload: BulkFlag, request: Request) -> dict[str, int]:
+    ensure_unlocked(request, payload.example_ids)
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
             result = database_connection.execute(
@@ -2112,6 +2182,7 @@ def bulk_set_flag(payload: BulkFlag, request: Request) -> dict[str, int]:
 def accept_proposals(payload: BulkExamples, request: Request) -> dict[str, int | str | None]:
     """Proposal becomes a regular example with the flag the agent proposed (kept as proposed_flag for later scoring).
     A fix proposal (metadata.replaces) moves the example it replaces to the trash."""
+    ensure_unlocked(request, payload.example_ids)
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
             replaced = [
@@ -2143,6 +2214,7 @@ def accept_proposals(payload: BulkExamples, request: Request) -> dict[str, int |
 
 @app.post("/api/examples/bulk/split")
 def bulk_set_split(payload: BulkSplit, request: Request) -> dict[str, int]:
+    ensure_unlocked(request, payload.example_ids)
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
             result = database_connection.execute(
@@ -2157,6 +2229,7 @@ REVISIONS_DIR = Path("/workspace/data/revisions")
 
 @app.post("/api/examples/bulk/transform")
 def bulk_transform(payload: BulkTransform, request: Request) -> dict:
+    ensure_unlocked(request, payload.example_ids)
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
             rows = database_connection.execute(
@@ -2216,17 +2289,76 @@ def revert_revision(revision_id: str, request: Request) -> dict[str, int]:
     rows = json.loads(path.read_text(encoding="utf-8"))["rows"]
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
-            with database_connection.cursor() as cursor:
-                cursor.executemany(
-                    "UPDATE training_examples SET messages = %s::jsonb WHERE id = %s",
-                    [(json.dumps(row["messages"], ensure_ascii=False), row["id"]) for row in rows],
+            for row in rows:
+                # Agent edits also keep split and metadata (flag, task); older transform revisions only messages.
+                database_connection.execute(
+                    """
+                    UPDATE training_examples
+                    SET messages = %s::jsonb, split = COALESCE(%s, split), metadata = COALESCE(%s::jsonb, metadata)
+                    WHERE id = %s
+                    """,
+                    (
+                        json.dumps(row["messages"], ensure_ascii=False),
+                        row.get("split"),
+                        json.dumps(row["metadata"], ensure_ascii=False) if row.get("metadata") is not None else None,
+                        row["id"],
+                    ),
                 )
     path.rename(path.with_suffix(".reverted"))
     return {"reverted": len(rows)}
 
 
+def apply_example_updates(request: Request, corpus_id: UUID, event: dict | None, source: str) -> dict:
+    """Writes agent edits of accepted examples; the previous version goes to a revision the user can revert."""
+    if not event:
+        return {"written": 0, "revision": None}
+    updates = {item["id"]: item for item in event["updated"]}
+    with request.app.state.pool.connection() as database_connection:
+        with database_connection.transaction():
+            originals = database_connection.execute(
+                """
+                SELECT id, messages, split, metadata FROM training_examples
+                WHERE id = ANY(%s::uuid[]) AND corpus_id = %s AND metadata->>'flag' IS DISTINCT FROM 'proposal'
+                FOR UPDATE
+                """,
+                (list(updates), corpus_id),
+            ).fetchall()
+            if not originals:
+                return {"written": 0, "revision": None}
+            revision_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:8]}"
+            REVISIONS_DIR.mkdir(parents=True, exist_ok=True)
+            (REVISIONS_DIR / f"{revision_id}.json").write_text(
+                json.dumps(
+                    {
+                        "transform": f"edit:{source}",
+                        "created_at": time.time(),
+                        "rows": [
+                            {"id": str(row["id"]), "messages": row["messages"], "split": row["split"], "metadata": row["metadata"]}
+                            for row in originals
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            for row in originals:
+                item = updates[str(row["id"])]
+                database_connection.execute(
+                    """
+                    UPDATE training_examples
+                    SET messages = %s::jsonb, split = %s,
+                        metadata = metadata || jsonb_build_object('flag', %s::text, 'edited_at', now(), 'edited_by', %s::text)
+                            || jsonb_strip_nulls(jsonb_build_object('task', %s::text))
+                    WHERE id = %s
+                    """,
+                    (json.dumps(item["messages"], ensure_ascii=False), item["split"], item["flag"], source, item.get("task"), row["id"]),
+                )
+    return {"written": len(originals), "revision": revision_id}
+
+
 @app.post("/api/examples/bulk/system-prompt")
 def bulk_set_system_prompt(payload: BulkSystemPrompt, request: Request) -> dict[str, int]:
+    ensure_unlocked(request, payload.example_ids)
     if "\x00" in payload.prompt:
         raise HTTPException(
             status_code=422,
@@ -2271,6 +2403,7 @@ def bulk_set_system_prompt(payload: BulkSystemPrompt, request: Request) -> dict[
 
 @app.post("/api/examples/bulk/classify")
 def bulk_classify(payload: BulkExamples, request: Request) -> dict[str, int]:
+    ensure_unlocked(request, payload.example_ids)
     if len(payload.example_ids) > 100:
         raise HTTPException(status_code=422, detail="Jednorazowo można klasyfikować maksymalnie 100 encji.")
     with request.app.state.pool.connection() as database_connection:
@@ -2314,6 +2447,7 @@ def automatic_classification_status() -> dict[str, int | str | None]:
 
 @app.post("/api/examples/classification/start")
 def start_automatic_classification(payload: BulkExamples, request: Request) -> dict[str, int | str | None]:
+    ensure_unlocked(request, payload.example_ids)
     with CLASSIFICATION_LOCK:
         if CLASSIFICATION_JOB["state"] == "running":
             raise HTTPException(status_code=409, detail="Automatyczna klasyfikacja już trwa.")
@@ -2338,6 +2472,7 @@ def start_automatic_classification(payload: BulkExamples, request: Request) -> d
 
 @app.post("/api/examples/bulk/delete")
 def bulk_delete(payload: BulkExamples, request: Request) -> dict:
+    ensure_unlocked(request, payload.example_ids)
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
             deleted, trash_id = delete_to_trash(database_connection, payload.example_ids)
@@ -2349,10 +2484,11 @@ TRASH_ID_PATTERN = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$")
 
 
 def delete_to_trash(
-    database_connection, example_ids: list[UUID], corpus: dict | None = None
+    database_connection, example_ids: list[UUID], corpus: dict | None = None, conversations: list[dict] | None = None
 ) -> tuple[int, str | None]:
     """Delete examples, keeping full rows in a trash file so the deletion can be undone.
-    With a corpus row, the file also restores the corpus itself."""
+    With a corpus row, the file also restores the corpus itself and its assistant conversations
+    (their sandbox folders are kept, so a restored conversation keeps its files)."""
     rows = database_connection.execute(
         """
         DELETE FROM training_examples WHERE id = ANY(%s)
@@ -2368,7 +2504,12 @@ def delete_to_trash(
     # Written inside the transaction: if this fails, the DELETE is rolled back.
     (TRASH_DIR / f"{trash_id}.json").write_text(
         json.dumps(
-            {"deleted_at": time.time(), "rows": rows, **({"corpus": corpus} if corpus else {})},
+            {
+                "deleted_at": time.time(),
+                "rows": rows,
+                **({"corpus": corpus} if corpus else {}),
+                **({"conversations": conversations} if conversations else {}),
+            },
             ensure_ascii=False,
             default=str,
         ),
@@ -2415,6 +2556,21 @@ def restore_trash(trash_id: str, request: Request) -> dict:
                         corpus["created_at"],
                     ),
                 )
+            for conversation in data.get("conversations", []):
+                database_connection.execute(
+                    """
+                    INSERT INTO agent_conversations (id, corpus_id, title, events, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s::jsonb, %s::timestamptz, %s::timestamptz) ON CONFLICT (id) DO NOTHING
+                    """,
+                    (
+                        conversation["id"],
+                        conversation["corpus_id"],
+                        conversation["title"],
+                        json.dumps(conversation["events"], ensure_ascii=False),
+                        conversation["created_at"],
+                        conversation["updated_at"],
+                    ),
+                )
             restored = 0
             for row in rows:
                 result = database_connection.execute(
@@ -2442,6 +2598,7 @@ def restore_trash(trash_id: str, request: Request) -> dict:
 
 @app.put("/api/examples/{example_id}")
 def update_example(example_id: UUID, payload: ExampleCreate, request: Request) -> dict:
+    ensure_unlocked(request, [example_id])
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
             result = database_connection.execute(
@@ -2467,6 +2624,7 @@ def update_example(example_id: UUID, payload: ExampleCreate, request: Request) -
 
 @app.delete("/api/examples/{example_id}")
 def delete_example(example_id: UUID, request: Request) -> dict:
+    ensure_unlocked(request, [example_id])
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
             deleted, trash_id = delete_to_trash(database_connection, [example_id])
@@ -2784,20 +2942,20 @@ def draft_analysis_issues(example_id: UUID, draft: DraftMessages, request: Reque
     return issues_for_example(example_id, request, draft)
 
 
-def save_proposals(request: Request, corpus_id: UUID, drafts: list[dict], source: str) -> dict:
+def save_proposals(request: Request, corpus_id: UUID, drafts: list[dict], source: str, batch: str | None = None) -> dict:
     """Agent drafts land in the corpus flagged as proposals; the user accepts or rejects them in the Propozycje tab."""
     if not drafts:
-        return {"saved": 0, "batch": None}
-    batch = f"proposal-{uuid4()}"
+        return {"saved": 0, "batch": None, "ids": []}
+    batch = batch or f"proposal-{uuid4()}"
     with request.app.state.pool.connection() as database_connection:
         with database_connection.transaction():
-            with database_connection.cursor() as cursor:
-                cursor.executemany(
-                    """
-                    INSERT INTO training_examples (corpus_id, split, messages, source, metadata)
-                    VALUES (%s, %s, %s::jsonb, %s, %s::jsonb)
-                    """,
-                    [
+            ids = [
+                str(
+                    database_connection.execute(
+                        """
+                        INSERT INTO training_examples (corpus_id, split, messages, source, metadata)
+                        VALUES (%s, %s, %s::jsonb, %s, %s::jsonb) RETURNING id
+                        """,
                         (
                             corpus_id,
                             draft["split"],
@@ -2810,13 +2968,15 @@ def save_proposals(request: Request, corpus_id: UUID, drafts: list[dict], source
                                     "import_id": batch,
                                     **({"replaces": draft["replaces"]} if draft.get("replaces") else {}),
                                     **({"task": draft["task"]} if draft.get("task") else {}),
+                                    **({"rejected": draft["rejected"], "rejected_model": source} if draft.get("rejected") else {}),
                                 }
                             ),
-                        )
-                        for draft in drafts
-                    ],
+                        ),
+                    ).fetchone()["id"]
                 )
-    return {"saved": len(drafts), "batch": batch}
+                for draft in drafts
+            ]
+    return {"saved": len(drafts), "batch": batch, "ids": ids}
 
 
 def apply_proposal_changes(request: Request, corpus_id: UUID, event: dict | None) -> dict:
@@ -2904,11 +3064,25 @@ def agent_chat(payload: AgentChat, request: Request) -> StreamingResponse:
         ).fetchone()
         if corpus is None:
             raise HTTPException(status_code=404, detail="Corpus not found.")
+        conversation_id = payload.conversation_id
+        if conversation_id:
+            require_conversation(database_connection, conversation_id, payload.corpus_id)
+            if payload.messages[-1].role == "user":
+                content = payload.messages[-1].content
+                append_conversation_events(
+                    database_connection, conversation_id, [{"type": "user", "content": content}], conversation_title(content)
+                )
         settings = corpus_settings(database_connection, payload.corpus_id)
+        case_state = (
+            database_connection.execute("SELECT state FROM agent_conversations WHERE id = %s", (conversation_id,)).fetchone()["state"]
+            if conversation_id
+            else None
+        )
         rows = database_connection.execute(
             """
             SELECT id, split, messages, metadata->>'flag' AS flag, metadata->>'proposed_flag' AS proposed_flag,
-                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces, metadata->>'task' AS task
+                   metadata->>'import_id' AS batch, metadata->>'replaces' AS replaces, metadata->>'task' AS task,
+                   metadata->>'rejected' AS rejected
             FROM training_examples WHERE corpus_id = %s ORDER BY created_at
             """,
             (payload.corpus_id,),
@@ -2923,7 +3097,7 @@ def agent_chat(payload: AgentChat, request: Request) -> StreamingResponse:
         max_exchanges=settings["max_exchanges"],
     )
     messages = [message.model_dump() for message in payload.messages]
-    session_id = str(payload.conversation_id) if payload.conversation_id else None
+    session_id = str(conversation_id) if conversation_id else None
     sandbox_error = None
     session_files = ""
     if session_id and sandbox.configured:
@@ -2935,15 +3109,97 @@ def agent_chat(payload: AgentChat, request: Request) -> StreamingResponse:
     else:
         session_id = None
 
-    def execute(name: str, arguments: dict):
-        if session_id and name == READ_LARGE_FILE_TOOL["name"]:
+    # Tool levels: general (sandbox/filesystem + large-file reader) for every agent, medium corpus tools,
+    # top-level agents (generators, analyst); private tools of sub-agents are not exposed to the orchestrator.
+    general_tools = SANDBOX_TOOLS + [READ_LARGE_FILE_TOOL] if session_id else []
+
+    def execute_general(name: str, arguments: dict):
+        if name == READ_LARGE_FILE_TOOL["name"]:
             return read_large_file_session(sandbox, session_id, config["provider"], payload.model, **arguments)
-        if session_id and name in SANDBOX_TOOL_NAMES:
-            return sandbox.call(session_id, name, arguments), None
+        return sandbox.call(session_id, name, arguments), None
+
+    general = GeneralTools(general_tools, execute_general if session_id else None)
+    series_context = {
+        "corpus": corpus["name"],
+        "agent_prompt": settings["agent_prompt"].strip(),
+        "vocabulary": vocabulary_prompt(settings) if settings["entity_types"] else "",
+    }
+
+    def save_series(drafts: list[dict], batch: str) -> dict:
+        return save_proposals(request, payload.corpus_id, drafts, f"generator:{payload.model}", batch)
+
+    def reject_series(ids: list[str]) -> int:
+        return apply_proposal_changes(request, payload.corpus_id, {"type": "proposal_rejections", "ids": ids})["written"]
+
+    held_series: set[str] = set()
+
+    def hold_series(batch: str) -> None:
+        """Locks a series for the rest of this orchestrator turn (released when the stream ends)."""
+        if batch and batch not in held_series:
+            held_series.add(batch)
+            lock_series(batch)
+
+    def save_case_state() -> None:
+        if conversation_id:
+            with request.app.state.pool.connection() as database_connection:
+                database_connection.execute(
+                    "UPDATE agent_conversations SET state = %s::jsonb, updated_at = now() WHERE id = %s",
+                    (json.dumps(case_state, ensure_ascii=False), conversation_id),
+                )
+
+    def tracked(phase: str, arguments: dict, session):
+        """Records the series in the case state whatever the model does, and reminds it to mark its plan."""
+        nonlocal case_state
+        data, event = yield from session
+        case_state = record_series(case_state, phase, arguments, data)
+        save_case_state()
+        yield plan_event(case_state)
+        return {**data, "case_state": "Seria zapisana w stanie sprawy (series). Oznacz krok planu i zaktualizuj plan: update_plan."}, event
+
+    def execute(name: str, arguments: dict):
+        nonlocal case_state
+        if name in general.names:
+            return general(name, arguments)
+        if name == PLAN_TOOL["name"]:
+            # The model rewrites the whole state; series recorded by the system survive a rewrite that omits them.
+            known = {item["batch"]: item for item in (case_state or {}).get("series", [])}
+            case_state, data = update_plan(arguments)
+            given = {item.get("batch") for item in case_state["series"]}
+            case_state["series"] = [*case_state["series"], *(item for batch, item in known.items() if batch not in given)][-MAX_SERIES:]
+            save_case_state()
+            return data, plan_event(case_state)
         if name == "propose_examples":
             data, event = tools(name, arguments)
             saved = save_proposals(request, payload.corpus_id, event["examples"] if event else [], f"agent:{payload.model}")
-            return {**data, **saved}, ({"type": "proposals", **saved} if saved["saved"] else None)
+            return {**data, **saved}, (
+                {"type": "proposals", "saved": saved["saved"], "batch": saved["batch"]} if saved["saved"] else None
+            )
+        if name == GENERATE_EXAMPLES_TOOL["name"]:
+            # The batch is fixed up front so the series is locked from its first saved proposal.
+            arguments = {**arguments, "batch": arguments.get("batch") or f"proposal-{uuid4()}"}
+            hold_series(arguments["batch"])
+            return tracked(
+                "generate",
+                arguments,
+                generate_examples_session(config["provider"], payload.model, tools, arguments, series_context, save_series, general),
+            )
+        if name == ANALYZE_SERIES_TOOL["name"]:
+            hold_series(str(arguments.get("batch") or ""))
+            return tracked(
+                "analyze",
+                arguments,
+                analyze_series_session(
+                    config["provider"], payload.model, tools, arguments, series_context, save_series, reject_series, general
+                ),
+            )
+        if name == "update_examples":
+            data, event = tools(name, arguments)
+            written = apply_example_updates(request, payload.corpus_id, event, f"agent:{payload.model}")
+            return {**data, **written}, (
+                {"type": "examples_updated", "count": written["written"], "revision": written["revision"]}
+                if written["written"]
+                else None
+            )
         if name in {"update_proposals", "reject_proposals"}:
             data, event = tools(name, arguments)
             written = apply_proposal_changes(request, payload.corpus_id, event)
@@ -2971,27 +3227,38 @@ def agent_chat(payload: AgentChat, request: Request) -> StreamingResponse:
                 else []
             ),
             *([prompts["sandbox"] + session_files] if session_id else []),
+            prompts["case_state"].replace("{state}", render_state(case_state)),
             prompts["tool_envelope"],
         ]
     )
 
+    def emit(event: dict) -> str:
+        # Persisted before it is sent, so a closed browser tab does not lose the turn.
+        if conversation_id and event["type"] not in {"done", "usage"}:
+            with request.app.state.pool.connection() as database_connection:
+                append_conversation_events(database_connection, conversation_id, [event])
+        return json.dumps(event, ensure_ascii=False) + "\n"
+
     def stream():
         if sandbox_error:
-            yield json.dumps({"type": "error", "message": f"Agent działa bez sandboksa: {sandbox_error}"}, ensure_ascii=False) + "\n"
+            yield emit({"type": "error", "message": f"Agent działa bez sandboksa: {sandbox_error}"})
         try:
             for event in run_agent(
                 config["provider"],
                 payload.model,
                 system,
                 messages,
-                AGENT_TOOLS + (SANDBOX_TOOLS + [READ_LARGE_FILE_TOOL] if session_id else []),
+                AGENT_TOOLS + [PLAN_TOOL, GENERATE_EXAMPLES_TOOL, ANALYZE_SERIES_TOOL] + general.tools,
                 execute,
                 max_steps=60 if session_id else 30,
             ):
-                yield json.dumps(event, ensure_ascii=False) + "\n"
+                yield emit(event)
         except (RuntimeError, OSError) as error:
-            yield json.dumps({"type": "error", "message": str(error)}, ensure_ascii=False) + "\n"
-        yield json.dumps({"type": "done"}) + "\n"
+            yield emit({"type": "error", "message": str(error)})
+        finally:
+            for batch in held_series:
+                release_series(batch)
+        yield emit({"type": "done"})
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
@@ -3041,8 +3308,129 @@ def sandbox_call(action):
         raise HTTPException(status_code=503, detail="Sandbox nie jest skonfigurowany (SANDBOX_URL, SANDBOX_TOKEN).")
     try:
         return action()
+    except ToolError as error:
+        raise HTTPException(status_code=404 if error.code == "not_found" else 502, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+CONVERSATION_COLUMNS = "id, corpus_id, title, created_at, updated_at, jsonb_array_length(events) AS event_count"
+
+
+def conversation_title(text: str) -> str:
+    return " ".join(text.split())[:120]
+
+
+def require_conversation(database_connection, conversation_id: UUID, corpus_id: UUID | None = None) -> dict:
+    row = database_connection.execute(
+        "SELECT id, corpus_id FROM agent_conversations WHERE id = %s", (conversation_id,)
+    ).fetchone()
+    if row is None or (corpus_id is not None and row["corpus_id"] != corpus_id):
+        raise HTTPException(status_code=404, detail="Rozmowa nie istnieje.")
+    return row
+
+
+def append_conversation_events(database_connection, conversation_id: UUID, events: list[dict], title: str | None = None) -> None:
+    database_connection.execute(
+        """
+        UPDATE agent_conversations
+        SET events = events || %s::jsonb, title = COALESCE(title, %s), updated_at = now()
+        WHERE id = %s
+        """,
+        (json.dumps(events, ensure_ascii=False, default=str), title, conversation_id),
+    )
+
+
+def adopt_sandbox_sessions(database_connection, corpus_id: UUID) -> None:
+    """Sandbox folders of this corpus created before conversations were stored (no transcript) become conversations."""
+    if not sandbox.configured:
+        return
+    try:
+        sessions = sandbox.sessions()
+    except RuntimeError:
+        return
+    for session in sessions:
+        if (session.get("meta") or {}).get("corpus_id") != str(corpus_id):
+            continue
+        created = session.get("created_at") or time.time()
+        database_connection.execute(
+            """
+            INSERT INTO agent_conversations (id, corpus_id, created_at, updated_at)
+            VALUES (%s, %s, to_timestamp(%s), to_timestamp(%s)) ON CONFLICT (id) DO NOTHING
+            """,
+            (session["id"], corpus_id, created, session.get("opened_at") or created),
+        )
+
+
+@app.get("/api/corpora/{corpus_id}/conversations")
+def list_conversations(corpus_id: UUID, request: Request) -> list[dict]:
+    with request.app.state.pool.connection() as database_connection:
+        if database_connection.execute("SELECT 1 FROM corpora WHERE id = %s", (corpus_id,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail="Corpus not found.")
+        adopt_sandbox_sessions(database_connection, corpus_id)
+        return database_connection.execute(
+            f"SELECT {CONVERSATION_COLUMNS} FROM agent_conversations WHERE corpus_id = %s ORDER BY updated_at DESC",
+            (corpus_id,),
+        ).fetchall()
+
+
+@app.post("/api/corpora/{corpus_id}/conversations", status_code=status.HTTP_201_CREATED)
+def create_conversation(corpus_id: UUID, payload: ConversationCreate, request: Request) -> dict:
+    """Creates the conversation with its sandbox folder. Re-posting the same id is idempotent; a legacy
+    transcript fills a conversation that has no events yet (e.g. one adopted from its sandbox folder)."""
+    events = [{"type": "log", **item.model_dump()} for item in payload.legacy_log]
+    title = next((conversation_title(item.text) for item in payload.legacy_log if item.kind == "user"), None)
+    with request.app.state.pool.connection() as database_connection:
+        if database_connection.execute("SELECT 1 FROM corpora WHERE id = %s", (corpus_id,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail="Corpus not found.")
+        row = database_connection.execute(
+            f"""
+            INSERT INTO agent_conversations AS conversation (id, corpus_id, title, events, created_at, updated_at)
+            VALUES (%s, %s, %s, %s::jsonb, COALESCE(%s, now()), COALESCE(%s, now()))
+            ON CONFLICT (id) DO UPDATE SET
+                events = CASE WHEN conversation.events = '[]'::jsonb THEN EXCLUDED.events ELSE conversation.events END,
+                title = COALESCE(conversation.title, EXCLUDED.title)
+            WHERE conversation.corpus_id = EXCLUDED.corpus_id
+            RETURNING {CONVERSATION_COLUMNS}
+            """,
+            (payload.id, corpus_id, title, json.dumps(events, ensure_ascii=False), payload.created_at, payload.created_at),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=409, detail="Ta rozmowa należy do innego korpusu.")
+        corpus = database_connection.execute("SELECT name FROM corpora WHERE id = %s", (corpus_id,)).fetchone()
+    if sandbox.configured:
+        try:
+            sandbox.open(str(payload.id), {"corpus_id": str(corpus_id), "corpus": corpus["name"]})
+        except RuntimeError as error:
+            # The agent reopens the folder on every message and reports when it works without a sandbox.
+            print(f"sandbox open {payload.id}: {error}", flush=True)
+    return row
+
+
+@app.get("/api/agent/conversations/{conversation_id}")
+def get_conversation(conversation_id: UUID, request: Request) -> dict:
+    with request.app.state.pool.connection() as database_connection:
+        row = database_connection.execute(
+            f"SELECT {CONVERSATION_COLUMNS}, events, state FROM agent_conversations WHERE id = %s", (conversation_id,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Rozmowa nie istnieje.")
+    return row
+
+
+@app.delete("/api/agent/conversations/{conversation_id}")
+def delete_conversation(conversation_id: UUID, request: Request) -> dict:
+    """Deletes the conversation together with its sandbox folder; the folder goes first, so a failure keeps both."""
+    with request.app.state.pool.connection() as database_connection:
+        require_conversation(database_connection, conversation_id)
+        if sandbox.configured:
+            try:
+                sandbox.delete(str(conversation_id))
+            except ToolError as error:
+                if error.code != "not_found":
+                    raise HTTPException(status_code=502, detail=f"Nie usunięto folderu sandboksa: {error}") from error
+        database_connection.execute("DELETE FROM agent_conversations WHERE id = %s", (conversation_id,))
+    return {"deleted": str(conversation_id)}
 
 
 @app.get("/api/agent/sessions/{session_id}")
@@ -3099,9 +3487,18 @@ async def upload_agent_file(session_id: UUID, name: str, request: Request) -> di
         raise HTTPException(status_code=413, detail="Plik jest za duży (maks. 200 MB).")
 
     def upload() -> dict:
-        sandbox.open(str(session_id))
+        # Files only go to folders of stored conversations, keeping folders and conversations 1:1.
+        with request.app.state.pool.connection() as database_connection:
+            conversation = require_conversation(database_connection, session_id)
+            corpus = database_connection.execute(
+                "SELECT name FROM corpora WHERE id = %s", (conversation["corpus_id"],)
+            ).fetchone()
+        sandbox.open(str(session_id), {"corpus_id": str(conversation["corpus_id"]), "corpus": corpus["name"]})
         saved = sandbox.upload(str(session_id), f"uploads/{filename}", data, unique=True)
-        return sandbox.call(str(session_id), "attach", {"path": saved["path"]})
+        attachment = sandbox.call(str(session_id), "attach", {"path": saved["path"]})
+        with request.app.state.pool.connection() as database_connection:
+            append_conversation_events(database_connection, session_id, [{"type": "attachment", **attachment}])
+        return attachment
 
     return await run_in_threadpool(sandbox_call, upload)
 

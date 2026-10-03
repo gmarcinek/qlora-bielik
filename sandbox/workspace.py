@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -111,6 +112,12 @@ class Session:
         current["closed_at"] = time.time()
         self.meta_path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
         return self.info()
+
+    def delete(self) -> dict[str, Any]:
+        if not self.path.is_dir():
+            raise SandboxError("Sesja nie istnieje.", 404)
+        shutil.rmtree(self.path)
+        return {"id": self.id, "deleted": True}
 
     def info(self) -> dict[str, Any]:
         return {
@@ -574,3 +581,13 @@ class Workspace:
 
     def session(self, session_id: str) -> Session:
         return Session(self.root, self.shared, session_id)
+
+    def sessions(self) -> list[dict[str, Any]]:
+        """Metadata of every session folder (no file listings), for reconciling with the lab database."""
+        result = []
+        for path in sorted(self.root.iterdir()):
+            try:
+                result.append(self.session(path.name).meta())
+            except (SandboxError, OSError, json.JSONDecodeError):
+                continue
+        return result

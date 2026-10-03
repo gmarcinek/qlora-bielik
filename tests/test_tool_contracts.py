@@ -7,10 +7,24 @@ from bielik_lora import large_reader
 from bielik_lora.agent import ToolError, run_tool, schema_errors
 from bielik_lora.corpus_agent import TOOLS as CORPUS_TOOLS
 from bielik_lora.corpus_agent import CorpusAgentTools
+from bielik_lora.generation import ANALYST_TOOLS, ANALYZE_SERIES_TOOL, GENERATE_EXAMPLES_TOOL, GENERATOR_TOOLS
+from bielik_lora.orchestration import PLAN_TOOL
 from bielik_lora.sandbox_client import SANDBOX_TOOLS
 from sandbox.workspace import SandboxError, Workspace
 
-CONTRACTS = {tool["name"]: tool for tool in [*CORPUS_TOOLS, *SANDBOX_TOOLS, large_reader.READ_LARGE_FILE_TOOL]}
+CONTRACTS = {
+    tool["name"]: tool
+    for tool in [
+        *CORPUS_TOOLS,
+        *SANDBOX_TOOLS,
+        large_reader.READ_LARGE_FILE_TOOL,
+        GENERATE_EXAMPLES_TOOL,
+        ANALYZE_SERIES_TOOL,
+        PLAN_TOOL,
+        *GENERATOR_TOOLS,
+        *ANALYST_TOOLS,
+    ]
+}
 READER_CONTRACTS = {tool["name"]: tool for tool in large_reader.READER_TOOLS}
 
 

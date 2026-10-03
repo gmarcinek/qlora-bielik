@@ -310,6 +310,12 @@ class SandboxClient:
     def info(self, session_id: str) -> dict[str, Any]:
         return self.request("GET", f"/sessions/{session_id}", timeout=30)
 
+    def sessions(self) -> list[dict[str, Any]]:
+        return self.request("GET", "/sessions", timeout=30)
+
+    def delete(self, session_id: str) -> dict[str, Any]:
+        return self.request("DELETE", f"/sessions/{session_id}", timeout=120)
+
     def call(self, session_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", f"/sessions/{session_id}/tools/{name}", arguments)
 

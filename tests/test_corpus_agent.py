@@ -97,3 +97,34 @@ def test_run_tool_reports_errors_back_to_model():
     assert json.loads(output)["error"]["code"] == "invalid_arguments"
     assert events[0]["type"] == "tool_call" and events[1]["ok"] is False
     assert parse_arguments('{"limit": 2}') == {"limit": 2} and parse_arguments("zepsute") == {}
+
+
+def test_get_examples_by_id_reports_status():
+    pending = [{**row(9, "Propozycja: NIP 1", [{"type": "NIP"}]), "id": "p1", "batch": "proposal-x"}]
+    tools = CorpusAgentTools(ROWS, pending=pending)
+    result = tools.get_examples(["1", "p1", "nope"])
+    assert [(item["id"], item["status"]) for item in result["examples"]] == [("1", "corpus"), ("p1", "proposal")]
+    assert result["examples"][0]["user"] == "NIP: 525-26-85-595" and result["unknown"] == ["nope"]
+
+
+def test_update_examples_edits_accepted_examples_with_checks():
+    tools = CorpusAgentTools([*ROWS, row(3, "REGON 123", [{"type": "REGON"}], split="test")], pending=[{**row(9, "P", []), "id": "p1"}])
+    result, event = tools.update_examples(
+        [
+            {"id": 3, "user": "Inny fragment: REGON 999", "assistant": '{"entities": [{"type": "REGON"}], "summary": "s"}'},
+            {"id": "2", "user": "NIP: 525-26-85-595"},
+            {"id": "p1", "user": "x"},
+            {"id": "1", "flag": "negative"},
+        ]
+    )
+    assert result["updated"] == 1
+    reasons = [item["reason"] for item in result["rejected"]]
+    assert reasons[0].startswith("Duplikat") and "update_proposals" in reasons[1] and "pustą listę" in reasons[2]
+    updated = event["updated"][0]
+    assert updated["id"] == "3" and updated["split"] == "test" and updated["flag"] == "positive"
+    assert updated["messages"][0] == {"role": "system", "content": SYSTEM} and updated["messages"][1]["content"] == "Inny fragment: REGON 999"
+    # The old text is free again, the new one is taken.
+    assert tools.validate({"user": "REGON 123", "assistant": '{"entities": [], "summary": "s"}', "flag": "negative"}) is None
+    assert tools.validate({"user": "Inny fragment: REGON 999", "assistant": "{}", "flag": "negative"}).startswith("Duplikat")
+    _, event = tools.update_proposals([{"id": "1", "user": "z"}])
+    assert event is None

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <changeSet id="005-conversation-state" author="bielik-lab">
+        <comment>Orchestrator case state (intent, plan steps, findings) kept per conversation and fed back every turn.</comment>
+        <sql> ALTER TABLE agent_conversations ADD COLUMN state JSONB; </sql>
+        <rollback> ALTER TABLE agent_conversations DROP COLUMN IF EXISTS state; </rollback>
+    </changeSet>
+</databaseChangeLog>

@@ -124,8 +124,12 @@ def test_reader_agent_navigation_heads_notes_and_handoff(session, monkeypatch):
     assert telemetry["coverage_pct"] == 100.0 and telemetry["heads"] == 3 and telemetry["searches"] == 1
     assert telemetry["skips"] == 1 and telemetry["jumps"] == 1 and telemetry["rejected_facts"] == 1
     assert telemetry["llm_calls"] == len(steps) + 3 + 1
-    assert all(event["type"] == "progress" for event in events)
-    assert any("g\u0142owica 2" in event["message"] for event in events) and "synteza" in events[-2]["message"]
+    assert {event["type"] for event in events} == {"progress", "agent_tool"}
+    reader_calls = [event for event in events if event["type"] == "agent_tool" and event["phase"] == "call"]
+    assert len(reader_calls) == len(steps) and all(event["agent"] == "czytelnik" and event["scope"] == "R1" for event in reader_calls)
+    assert any(event["phase"] == "result" and not event["ok"] for event in events if event["type"] == "agent_tool")
+    progress_events = [event for event in events if event["type"] == "progress"]
+    assert any("g\u0142owica 2" in event["message"] for event in progress_events) and "synteza" in progress_events[-2]["message"]
 
     record = json.loads((session.path / "notes" / "reads" / "R1.json").read_text(encoding="utf-8"))
     assert record["interpretations"][0]["based_on"] == ["R1.F1"]

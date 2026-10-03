@@ -4,11 +4,13 @@ import {
   PointerEvent as ReactPointerEvent,
   ReactNode,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import {
   Bot,
+  BookOpen,
   ChevronDown,
   ChevronUp,
   Check,
@@ -34,9 +36,11 @@ import {
   Plus,
   RefreshCw,
   Send,
+  ShieldCheck,
   Sparkles,
   Square,
   Trash2,
+  WandSparkles,
   X,
 } from "lucide-react";
 import {
@@ -76,6 +80,9 @@ import {
   AgentModel,
   AgentSession,
   AgentAttachment,
+  AgentConversation,
+  AgentEvent,
+  StoredAgentEvent,
   ImportedExample,
   Message,
   MessageRole,
@@ -346,10 +353,590 @@ function autoMapRecords(
 
 type AgentRequest = { id: number; text: string };
 
+type LogMeta =
+  | {
+      category: "call";
+      name: string;
+      detail: string;
+      agent?: string;
+      scope?: string;
+      ok?: boolean;
+      ms?: number;
+      error?: string;
+    }
+  | { category: "progress"; source?: string }
+  | {
+      category: "plan";
+      status: string;
+      intent: string;
+      steps: Array<{ title: string; status: string }>;
+    }
+  | { category: "proposals" | "removed" | "parked" | "attachment" | "updated" };
+
 type AgentLogItem = {
   kind: "user" | "assistant" | "tool" | "error";
   text: string;
+  meta?: LogMeta;
 };
+
+function attachmentLog(attachment: AgentAttachment): string {
+  return `Załącznik ${attachment.id} → ${attachment.path} (${
+    attachment.handling === "markitdown"
+      ? attachment.converted
+        ? `MarkItDown: ${attachment.converted}, ${attachment.lines} linii`
+        : `konwersja nieudana: ${attachment.error}`
+      : attachment.handling === "text"
+        ? `tekst, ${attachment.lines} linii`
+        : "plik binarny"
+  })`;
+}
+
+const STEP_MARKS: Record<string, string> = {
+  done: "✓",
+  in_progress: "▶",
+  blocked: "✗",
+  skipped: "–",
+  pending: "○",
+};
+// Tools that start another agent; their calls are highlighted in the log.
+const AGENT_TOOLS = new Set([
+  "generate_examples",
+  "analyze_series",
+  "read_large_file_session",
+]);
+const PROGRESS_SOURCES: Record<string, string> = {
+  generate_examples: "generatory",
+  analyze_series: "analityk",
+  read_large_file_session: "czytelnik",
+};
+
+function eventToLog(event: StoredAgentEvent | AgentEvent): AgentLogItem | null {
+  switch (event.type) {
+    case "user":
+      return { kind: "user", text: event.content };
+    case "text":
+      return { kind: "assistant", text: event.content };
+    case "tool_call":
+      return event.name === "update_plan"
+        ? null
+        : {
+            kind: "tool",
+            text: toolLabel(event.name, event.arguments),
+            meta: {
+              category: "call",
+              name: event.name,
+              detail: toolDetail(event.name, event.arguments),
+            },
+          };
+    case "agent_tool":
+      return event.phase === "call"
+        ? {
+            kind: "tool",
+            text: `${event.agent} · ${event.name} ${event.detail ?? ""}`,
+            meta: {
+              category: "call",
+              name: event.name,
+              detail: event.detail ?? "",
+              agent: event.agent,
+              scope: event.scope,
+            },
+          }
+        : null;
+    case "progress":
+      return {
+        kind: "tool",
+        text: `… ${event.message}`,
+        meta: { category: "progress", source: PROGRESS_SOURCES[event.name] },
+      };
+    case "tool_result":
+      return null;
+    case "proposals_changed":
+      return {
+        kind: "tool",
+        text: `${event.action === "update_proposals" ? "Poprawiono" : "Odrzucono"} propozycje: ${event.count}`,
+        meta: { category: "removed" },
+      };
+    case "examples_parked":
+      return {
+        kind: "tool",
+        text: `Przeniesiono do „bez splitu” (poza trening): ${event.count}`,
+        meta: { category: "parked" },
+      };
+    case "examples_updated":
+      return {
+        kind: "tool",
+        text: `Zmieniono zaakceptowane przykłady: ${event.count} (poprzednia wersja zapisana — „Cofnij” nad listą)`,
+        meta: { category: "updated" },
+      };
+    case "proposals":
+      return {
+        kind: "tool",
+        text: `Zapisano w zakładce Propozycje: ${event.saved} (partia ${event.batch})`,
+        meta: { category: "proposals" },
+      };
+    case "error":
+      return { kind: "error", text: event.message };
+    case "plan":
+      return {
+        kind: "tool",
+        text: `Plan (${event.status}): ${event.intent} — ${event.steps
+          .map((step) => `${STEP_MARKS[step.status] ?? "○"} ${step.title}`)
+          .join(" · ")}`,
+        meta: {
+          category: "plan",
+          status: event.status,
+          intent: event.intent,
+          steps: event.steps,
+        },
+      };
+    case "attachment":
+      return {
+        kind: "tool",
+        text: attachmentLog(event),
+        meta: { category: "attachment" },
+      };
+    case "log":
+      return { kind: event.kind, text: event.text };
+    default:
+      return null;
+  }
+}
+
+/** Adds an event to the log; a tool result completes its own call line instead of adding one. */
+function applyEvent(
+  log: AgentLogItem[],
+  event: StoredAgentEvent | AgentEvent,
+): AgentLogItem[] {
+  const result =
+    event.type === "tool_result"
+      ? { name: event.name, ok: event.ok, ms: event.ms, error: event.error }
+      : event.type === "agent_tool" && event.phase === "result"
+        ? {
+            name: event.name,
+            agent: event.agent,
+            ok: event.ok ?? true,
+            ms: event.ms,
+            error: event.error,
+          }
+        : null;
+  if (result) {
+    for (let index = log.length - 1; index >= 0; index -= 1) {
+      const meta = log[index].meta;
+      if (
+        meta?.category === "call" &&
+        meta.ok === undefined &&
+        meta.name === result.name &&
+        meta.agent === ("agent" in result ? result.agent : undefined)
+      ) {
+        const next = [...log];
+        next[index] = {
+          ...log[index],
+          meta: { ...meta, ok: result.ok, ms: result.ms, error: result.error },
+        };
+        return next;
+      }
+    }
+    return result.ok || result.name === "update_plan"
+      ? log
+      : [...log, { kind: "error", text: `${result.name}: ${result.error ?? "błąd"}` }];
+  }
+  const item = eventToLog(event);
+  return item ? [...log, item] : log;
+}
+
+const eventsToLog = (events: StoredAgentEvent[]) =>
+  events.reduce<AgentLogItem[]>(applyEvent, []);
+
+function agentClass(agent: string) {
+  if (agent.startsWith("generator")) return "agent-generator";
+  if (agent.startsWith("analityk")) return "agent-analyst";
+  if (agent.startsWith("czytelnik")) return "agent-reader";
+  return "agent-other";
+}
+
+type AgentTheme = "assistant" | "generator" | "analyst" | "reader" | "other";
+
+const AGENT_AVATARS: Record<AgentTheme, typeof Sparkles> = {
+  assistant: Sparkles,
+  generator: WandSparkles,
+  analyst: ShieldCheck,
+  reader: BookOpen,
+  other: Bot,
+};
+
+function agentTheme(agent: string): AgentTheme {
+  if (agent === "asystent") return "assistant";
+  if (agent.startsWith("generator")) return "generator";
+  if (agent.startsWith("analityk")) return "analyst";
+  if (agent.startsWith("czytelnik")) return "reader";
+  return "other";
+}
+
+const PROGRESS_AGENT = /^(generator \d+\/\d+|analityk|R\d+)(?: („[^”]*”))?:\s*([\s\S]*)$/;
+
+/** Agent (and its scope) a log line belongs to: a sub-agent tool call or an attributed progress message. */
+function itemAgent(item: AgentLogItem): { agent: string; scope?: string } | null {
+  const meta = item.meta;
+  if (meta?.category === "call" && meta.agent)
+    return { agent: meta.agent, scope: meta.scope };
+  if (meta?.category !== "progress") return null;
+  const match = item.text.replace(/^… /, "").match(PROGRESS_AGENT);
+  if (!match) return null;
+  if (/^R\d+$/.test(match[1])) return { agent: "czytelnik", scope: match[1] };
+  return {
+    agent: match[1],
+    scope: match[2]?.replace(/^„|”$/g, "").replace(/…$/, ""),
+  };
+}
+
+type LogSegment =
+  | { type: "item"; item: AgentLogItem; key: string }
+  | {
+      type: "bubble";
+      agent: string;
+      scope?: string;
+      items: AgentLogItem[];
+      key: string;
+    };
+
+/** Messages stay as they are; tool lines go to the bubble of the agent that produced them (parallel agents get one each). */
+function groupLog(log: AgentLogItem[]): LogSegment[] {
+  const segments: LogSegment[] = [];
+  let run: Map<string, Extract<LogSegment, { type: "bubble" }>> | null = null;
+  let last: Extract<LogSegment, { type: "bubble" }> | null = null;
+  let assistant: Extract<LogSegment, { type: "bubble" }> | null = null;
+  log.forEach((item, index) => {
+    const meta = item.meta;
+    if (item.kind !== "tool" || meta?.category === "plan") {
+      run = last = assistant = null;
+      segments.push({ type: "item", item, key: `i${index}` });
+      return;
+    }
+    const owner = itemAgent(item);
+    if (owner) {
+      assistant = null;
+      run ??= new Map();
+      const key = `${owner.agent}|${(owner.scope ?? "").slice(0, 40)}`;
+      let bubble = run.get(key);
+      if (!bubble) {
+        bubble = { type: "bubble", ...owner, items: [], key: `b${index}` };
+        run.set(key, bubble);
+        segments.push(bubble);
+      }
+      bubble.items.push(item);
+      last = bubble;
+      return;
+    }
+    if (
+      run &&
+      last &&
+      meta &&
+      ["proposals", "removed", "parked", "updated", "progress"].includes(meta.category)
+    ) {
+      last.items.push(item);
+      return;
+    }
+    run = last = null;
+    if (!assistant) {
+      assistant = { type: "bubble", agent: "asystent", items: [], key: `a${index}` };
+      segments.push(assistant);
+    }
+    assistant.items.push(item);
+  });
+  return segments;
+}
+
+function BubbleLine({ item, live }: { item: AgentLogItem; live: boolean }) {
+  const meta = item.meta;
+  if (meta?.category === "call")
+    return (
+      <div className="agent-line">
+        <span className={`tool-name${AGENT_TOOLS.has(meta.name) ? " launches" : ""}`}>
+          {meta.name}
+        </span>
+        {meta.detail && <span className="tool-detail">{meta.detail}</span>}
+        {meta.ok === true && (
+          <span className="tool-ok">
+            ✓{meta.ms !== undefined ? ` ${(meta.ms / 1000).toFixed(1)} s` : ""}
+          </span>
+        )}
+        {meta.ok === false && (
+          <span className="tool-fail">✗ {meta.error ?? "błąd"}</span>
+        )}
+        {meta.ok === undefined && live && <span className="tool-running">⋯</span>}
+      </div>
+    );
+  if (meta?.category === "progress") {
+    const message = item.text.replace(/^… /, "");
+    return (
+      <div className="agent-line agent-line-progress">
+        {message.match(PROGRESS_AGENT)?.[3] ?? message}
+      </div>
+    );
+  }
+  if (meta && meta.category !== "plan") {
+    const icon = { proposals: "＋", removed: "−", parked: "⇣", attachment: "📎", updated: "✎" }[
+      meta.category
+    ];
+    return (
+      <div className={`agent-line agent-log-${meta.category}`}>
+        {icon} {item.text}
+      </div>
+    );
+  }
+  return <div className="agent-line">{item.text}</div>;
+}
+
+/** Animated "working" card: elapsed time, current activity and the agents of this turn. */
+function AgentWorking({
+  log,
+  onLayout,
+}: {
+  log: AgentLogItem[];
+  onLayout: () => void;
+}) {
+  const [started] = useState(() => Date.now());
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const turn = log.slice(log.map((item) => item.kind).lastIndexOf("user") + 1);
+  const team = new Map<string, boolean>();
+  for (const item of turn) {
+    const owner = itemAgent(item);
+    if (!owner) continue;
+    const finished =
+      item.meta?.category === "progress" &&
+      /zakończył|usunięto \d+, dogenerowano|gotowe/.test(item.text);
+    team.set(owner.agent, (team.get(owner.agent) ?? false) || finished);
+  }
+  const last = [...turn]
+    .reverse()
+    .find((item) => item.kind === "tool" && item.meta?.category !== "plan");
+  const owner = last ? itemAgent(last) : null;
+  const activity = !last
+    ? "myśli nad odpowiedzią"
+    : last.meta?.category === "call"
+      ? last.meta.name
+      : last.text.replace(/^… /, "").replace(PROGRESS_AGENT, "$3");
+  const seconds = Math.floor((now - started) / 1000);
+  // The card grows (activity line, agent avatars) without a new log entry; keep it above the composer.
+  useLayoutEffect(onLayout, [activity, team.size, onLayout]);
+  return (
+    <div className="agent-working" role="status" aria-live="polite">
+      <div className="agent-working-head">
+        <span className="agent-working-orb" aria-hidden="true">
+          <Sparkles size={14} />
+        </span>
+        <span>
+          Asystent pracuje
+          <span className="agent-working-dots" aria-hidden="true">
+            <i />
+            <i />
+            <i />
+          </span>
+        </span>
+        <span className="agent-working-time" title="Czas tej tury">
+          {Math.floor(seconds / 60)}:{String(seconds % 60).padStart(2, "0")}
+        </span>
+      </div>
+      <div className="agent-working-bar" aria-hidden="true" />
+      <div
+        className={`agent-working-activity theme-${agentTheme(owner?.agent ?? "asystent")}`}
+        key={activity}
+      >
+        <b>{owner?.agent ?? "Asystent"}</b> · {activity}
+      </div>
+      {team.size > 0 && (
+        <div className="agent-working-team" aria-label="Agenci w tej turze">
+          {[...team].map(([agent, done]) => {
+            const theme = agentTheme(agent);
+            const Avatar = AGENT_AVATARS[theme];
+            return (
+              <span
+                className={`team-member theme-${theme}${done ? " done" : ""}`}
+                title={`${agent}${done ? " — zakończył" : " — pracuje"}`}
+                key={agent}
+              >
+                <Avatar size={12} />
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgentBubble({
+  segment,
+  live,
+}: {
+  segment: Extract<LogSegment, { type: "bubble" }>;
+  live: boolean;
+}) {
+  const theme = agentTheme(segment.agent);
+  const Avatar = AGENT_AVATARS[theme];
+  return (
+    <div className={`agent-bubble theme-${theme}`}>
+      <div className="agent-avatar" title={segment.agent} aria-hidden="true">
+        <Avatar size={15} />
+      </div>
+      <div className="agent-bubble-body">
+        <div className="agent-bubble-head">
+          <strong>{segment.agent === "asystent" ? "Asystent" : segment.agent}</strong>
+          {segment.scope && (
+            <span className="agent-bubble-scope" title={segment.scope}>
+              {segment.scope}
+            </span>
+          )}
+        </div>
+        {segment.items.map((item, index) => (
+          <BubbleLine item={item} live={live} key={index} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LogLine({ item, live }: { item: AgentLogItem; live: boolean }) {
+  const meta = item.meta;
+  if (item.kind === "error")
+    return <div className="agent-log agent-log-error">✗ {item.text}</div>;
+  if (!meta) return <div className="entity-agent-tool">→ {item.text}</div>;
+  if (meta.category === "call")
+    return (
+      <div className={`agent-log agent-log-call${meta.agent ? " sub" : ""}`}>
+        {meta.agent && (
+          <span
+            className={`agent-chip ${agentClass(meta.agent)}`}
+            title={meta.scope}
+          >
+            {meta.agent}
+          </span>
+        )}
+        <span
+          className={`tool-badge${AGENT_TOOLS.has(meta.name) ? " agent-tool" : ""}`}
+        >
+          {meta.name}
+        </span>
+        {meta.detail && <span className="tool-detail">{meta.detail}</span>}
+        {meta.ok === true && (
+          <span className="tool-ok">
+            ✓{meta.ms !== undefined ? ` ${(meta.ms / 1000).toFixed(1)} s` : ""}
+          </span>
+        )}
+        {meta.ok === false && (
+          <span className="tool-fail">✗ {meta.error ?? "błąd"}</span>
+        )}
+        {meta.ok === undefined && live && (
+          <span className="tool-running">⋯</span>
+        )}
+      </div>
+    );
+  if (meta.category === "progress") {
+    const message = item.text.replace(/^… /, "");
+    const match = message.match(
+      /^(generator \d+\/\d+|analityk|R\d+)(?: („[^”]*”))?:\s*([\s\S]*)$/,
+    );
+    const agent = match?.[1] ?? meta.source;
+    return (
+      <div className="agent-log agent-log-progress">
+        {agent && (
+          <span
+            className={`agent-chip ${agentClass(
+              agent === "generatory"
+                ? "generator"
+                : /^R\d+$/.test(agent)
+                  ? "czytelnik"
+                  : agent,
+            )}`}
+            title={match?.[2]}
+          >
+            {agent}
+          </span>
+        )}
+        {match ? match[3] : message}
+      </div>
+    );
+  }
+  if (meta.category === "plan")
+    return (
+      <div className="agent-log-plan">
+        <div className="agent-log-plan-head">
+          <strong>Plan</strong>
+          <span className="plan-status">{meta.status}</span>
+        </div>
+        <div className="agent-log-plan-intent">{meta.intent}</div>
+        <ol>
+          {meta.steps.map((step, index) => (
+            <li className={`plan-step plan-${step.status}`} key={index}>
+              <span className="plan-mark">{STEP_MARKS[step.status] ?? "○"}</span>{" "}
+              {step.title}
+            </li>
+          ))}
+        </ol>
+      </div>
+    );
+  const icon = { proposals: "＋", removed: "−", parked: "⇣", attachment: "📎", updated: "✎" }[
+    meta.category
+  ];
+  return (
+    <div className={`agent-log agent-log-${meta.category}`}>
+      {icon} {item.text}
+    </div>
+  );
+}
+
+type LegacyChat = { id: string; createdAt?: number; log: AgentLogItem[] };
+
+function legacyChats(corpusId: string): LegacyChat[] {
+  const isLog = (value: unknown): value is AgentLogItem[] =>
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        item &&
+        ["user", "assistant", "tool", "error"].includes(item.kind) &&
+        typeof item.text === "string",
+    );
+  const chats: LegacyChat[] = [];
+  const history = localStorage.getItem(`entity-agent-history:${corpusId}`);
+  if (history) {
+    const saved = JSON.parse(history);
+    if (!Array.isArray(saved.chats))
+      throw new Error("Niepoprawny format zapisanej historii czatów.");
+    for (const chat of saved.chats) {
+      if (typeof chat?.id !== "string" || !isLog(chat.log))
+        throw new Error("Niepoprawny format zapisanej historii czatów.");
+      chats.push({ id: chat.id, createdAt: chat.createdAt, log: chat.log });
+    }
+  }
+  const single = localStorage.getItem(`entity-agent:${corpusId}`);
+  if (single) {
+    const saved = JSON.parse(single);
+    if (typeof saved.conversationId !== "string" || !isLog(saved.log))
+      throw new Error("Niepoprawny format zapisanej rozmowy.");
+    if (!chats.some((chat) => chat.id === saved.conversationId))
+      chats.push({ id: saved.conversationId, log: saved.log });
+  }
+  return chats.filter((chat) => chat.log.length);
+}
+
+async function importLegacyChats(corpusId: string): Promise<number> {
+  const chats = legacyChats(corpusId);
+  for (const chat of chats)
+    await api.createConversation(corpusId, {
+      id: chat.id,
+      legacy_log: chat.log,
+      ...(typeof chat.createdAt === "number"
+        ? { created_at: new Date(chat.createdAt).toISOString() }
+        : {}),
+    });
+  localStorage.removeItem(`entity-agent-history:${corpusId}`);
+  localStorage.removeItem(`entity-agent:${corpusId}`);
+  return chats.length;
+}
 
 const SESSION_AREAS: Array<[string, string]> = [
   ["uploads", "Załączniki (uploads)"],
@@ -665,36 +1252,66 @@ function prettyAnswer(answer: string) {
   }
 }
 
-function toolLabel(name: string, args: Record<string, unknown>) {
+function toolDetail(name: string, args: Record<string, unknown>) {
+  const text = (value: unknown, limit: number) => {
+    const raw = typeof value === "string" ? value : JSON.stringify(value);
+    return raw.length > limit ? `${raw.slice(0, limit)}…` : raw;
+  };
+  if (name === "generate_examples") {
+    const assignments = Array.isArray(args.assignments) ? args.assignments : [];
+    const total = assignments.reduce(
+      (sum: number, item) => sum + (Number((item as { count?: number }).count) || 25),
+      0,
+    );
+    return `cel: ${text(args.goal ?? "", 120)} · ${assignments.length} zleceń, ${total} przykładów · ${String(args.training_mode ?? "sft").toUpperCase()}`;
+  }
+  if (name === "analyze_series")
+    return `seria ${String(args.batch ?? "").slice(-8)} · cel: ${text(args.goal ?? "", 120)}`;
   const details = Object.entries(args)
     .filter(([key]) => key !== "examples")
-    .map(([key, value]) => {
-      const text = JSON.stringify(value);
-      return `${key}=${text.length > 160 ? `${text.slice(0, 160)}…` : text}`;
-    })
+    .map(([key, value]) => `${key}=${text(value, 120)}`)
     .join(", ");
   const count = Array.isArray(args.examples)
-    ? ` (${args.examples.length})`
+    ? `${args.examples.length} przykładów${details ? " · " : ""}`
     : "";
-  return `${name}${count}${details ? ` · ${details}` : ""}`;
+  return text(`${count}${details}`, 400);
+}
+
+function toolLabel(name: string, args: Record<string, unknown>) {
+  const detail = toolDetail(name, args);
+  return `${name}${detail ? ` · ${detail}` : ""}`;
 }
 
 function EntityAgentPanel({
   corpus,
   onAdded,
   request,
+  conversationId,
+  persisted,
+  initialLog,
+  ensureConversation,
+  onNewChat,
+  onBusyChange,
+  onConversationChanged,
+  onExamplesEdited,
 }: {
   corpus: Corpus | undefined;
   onAdded: () => Promise<void>;
   request?: AgentRequest | null;
+  conversationId: string;
+  persisted: boolean;
+  initialLog: AgentLogItem[];
+  ensureConversation: () => Promise<void>;
+  onNewChat: () => void;
+  onBusyChange: (busy: boolean) => void;
+  onConversationChanged: () => void;
+  onExamplesEdited?: (revision: string, count: number) => void;
 }) {
-  const storageKey = corpus ? `entity-agent:${corpus.id}` : "";
+  const [log, setLog] = useState<AgentLogItem[]>(initialLog);
   const [models, setModels] = useState<AgentModel[]>([]);
   const [model, setModel] = useState(
     () => localStorage.getItem("entity-agent-model") ?? "",
   );
-  const [log, setLog] = useState<AgentLogItem[]>([]);
-  const [conversationId, setConversationId] = useState("");
   const [session, setSession] = useState<AgentSession | null>(null);
   const [filesOpen, setFilesOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -705,6 +1322,8 @@ function EntityAgentPanel({
   const abortRef = useRef<AbortController | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
+  // A request that was already pending when this chat opened belongs to another chat.
+  const handledRequestRef = useRef(request?.id);
   const refreshFiles = (sessionId: string) =>
     api
       .agentSession(sessionId)
@@ -729,21 +1348,25 @@ function EntityAgentPanel({
       setModel(corpusModel);
   }, [corpus?.id, corpusModel, models]);
   useEffect(() => {
-    if (!storageKey) return;
-    const saved = JSON.parse(localStorage.getItem(storageKey) ?? "{}");
-    const sessionId: string = saved.conversationId ?? crypto.randomUUID();
-    setLog(saved.log ?? []);
-    setConversationId(sessionId);
-    setSession(null);
-    void refreshFiles(sessionId);
-  }, [storageKey]);
+    if (persisted) void refreshFiles(conversationId);
+  }, [conversationId, persisted]);
+  useEffect(() => () => abortRef.current?.abort(), []);
   useEffect(() => {
-    if (storageKey && conversationId)
-      localStorage.setItem(storageKey, JSON.stringify({ log, conversationId }));
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [storageKey, log, conversationId]);
+    onBusyChange(busy || uploading > 0);
+  }, [busy, uploading, onBusyChange]);
+  useEffect(() => () => onBusyChange(false), [onBusyChange]);
+  // Follow new output only while the user is at the bottom; reading older messages is not interrupted.
+  const stickToBottomRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const keepAtBottom = () => {
+    const element = logRef.current;
+    if (element && stickToBottomRef.current)
+      element.scrollTo({ top: element.scrollHeight });
+  };
+  useLayoutEffect(keepAtBottom, [log, busy, uploading]);
   useEffect(() => {
-    if (!request) return;
+    if (!request || request.id === handledRequestRef.current) return;
+    handledRequestRef.current = request.id;
     // While the agent is busy the request waits in the composer instead of being lost.
     if (busy || !model) setInput(request.text);
     else void send(request.text);
@@ -754,12 +1377,15 @@ function EntityAgentPanel({
     if (!corpus || !model || !text || busy) return;
     const history = [...log, { kind: "user" as const, text }];
     setLog(history);
+    stickToBottomRef.current = true;
     if (override === undefined) setInput("");
     setBusy(true);
     setError("");
     const controller = new AbortController();
     abortRef.current = controller;
+    let listed = false;
     try {
+      await ensureConversation();
       await api.agentChat(
         corpus.id,
         model,
@@ -770,61 +1396,21 @@ function EntityAgentPanel({
             content: item.text,
           })),
         (event) => {
-          if (event.type === "text")
-            setLog((current) => [
-              ...current,
-              { kind: "assistant", text: event.content },
-            ]);
-          else if (event.type === "tool_call")
-            setLog((current) => [
-              ...current,
-              { kind: "tool", text: toolLabel(event.name, event.arguments) },
-            ]);
-          else if (event.type === "progress")
-            setLog((current) => [
-              ...current,
-              { kind: "tool", text: `… ${event.message}` },
-            ]);
-          else if (event.type === "tool_result" && !event.ok)
-            setLog((current) => [
-              ...current,
-              {
-                kind: "error",
-                text: `${event.name}: ${event.error ?? "błąd"}`,
-              },
-            ]);
-          else if (event.type === "proposals_changed") {
-            setLog((current) => [
-              ...current,
-              {
-                kind: "tool",
-                text: `${event.action === "update_proposals" ? "Poprawiono" : "Odrzucono"} propozycje: ${event.count}`,
-              },
-            ]);
+          // The server stores the user message before streaming, so the chat can be listed right away.
+          if (!listed) {
+            listed = true;
+            onConversationChanged();
+          }
+          setLog((current) => applyEvent(current, event));
+          if (
+            event.type === "proposals" ||
+            event.type === "proposals_changed" ||
+            event.type === "examples_parked" ||
+            event.type === "examples_updated"
+          )
             void onAdded();
-          } else if (event.type === "examples_parked") {
-            setLog((current) => [
-              ...current,
-              {
-                kind: "tool",
-                text: `Przeniesiono do „bez splitu” (poza trening): ${event.count}`,
-              },
-            ]);
-            void onAdded();
-          } else if (event.type === "proposals") {
-            setLog((current) => [
-              ...current,
-              {
-                kind: "tool",
-                text: `Zapisano w zakładce Propozycje: ${event.saved} (partia ${event.batch})`,
-              },
-            ]);
-            void onAdded();
-          } else if (event.type === "error")
-            setLog((current) => [
-              ...current,
-              { kind: "error", text: event.message },
-            ]);
+          if (event.type === "examples_updated" && event.revision)
+            onExamplesEdited?.(event.revision, event.count);
         },
         controller.signal,
         conversationId,
@@ -839,15 +1425,20 @@ function EntityAgentPanel({
     } finally {
       abortRef.current = null;
       setBusy(false);
+      onConversationChanged();
+      // The series locks of this turn are released now; refresh so the proposals become editable.
+      void onAdded();
       void refreshFiles(conversationId);
     }
   };
   const uploadFiles = async (files: FileList | File[] | null) => {
     const list = files ? Array.from(files) : [];
     if (!list.length || !conversationId) return;
+    let pending = list.length;
     setUploading((count) => count + list.length);
     setError("");
     try {
+      await ensureConversation();
       for (const file of list) {
         try {
           const attachment = await api.uploadAgentFile(conversationId, file);
@@ -861,18 +1452,13 @@ function EntityAgentPanel({
             ...current,
             {
               kind: "tool",
-              text: `Załącznik ${attachment.id} → ${attachment.path} (${
-                attachment.handling === "markitdown"
-                  ? attachment.converted
-                    ? `MarkItDown: ${attachment.converted}, ${attachment.lines} linii`
-                    : `konwersja nieudana: ${attachment.error}`
-                  : attachment.handling === "text"
-                    ? `tekst, ${attachment.lines} linii`
-                    : "plik binarny"
-              })`,
+              text: attachmentLog(attachment),
+              meta: { category: "attachment" },
             },
           ]);
+          onConversationChanged();
         } finally {
+          pending -= 1;
           setUploading((count) => count - 1);
         }
       }
@@ -883,7 +1469,10 @@ function EntityAgentPanel({
           : String(requestError),
       );
     } finally {
+      // Files that were never started are no longer pending after a failure.
+      setUploading((count) => count - pending);
       if (uploadRef.current) uploadRef.current.value = "";
+      onConversationChanged();
       void refreshFiles(conversationId);
     }
   };
@@ -942,7 +1531,7 @@ function EntityAgentPanel({
               className={`btn btn-sm ${filesOpen ? "btn-secondary" : "btn-outline-secondary"}`}
               type="button"
               title="Pliki rozmowy"
-              disabled={!corpus}
+              disabled={!corpus || !persisted}
               onClick={() => {
                 setFilesOpen((open) => !open);
                 if (conversationId) void refreshFiles(conversationId);
@@ -965,16 +1554,10 @@ function EntityAgentPanel({
             <button
               className="btn btn-sm btn-outline-secondary"
               type="button"
-              disabled={busy || (!log.length && !visibleFiles.length)}
-              onClick={() => {
-                if (conversationId)
-                  void api.closeAgentSession(conversationId).catch(() => null);
-                setLog([]);
-                setSession(null);
-                setConversationId(crypto.randomUUID());
-              }}
+              disabled={busy || uploading > 0}
+              onClick={onNewChat}
             >
-              Nowa rozmowa
+              Nowy czat
             </button>
           </div>
         </div>
@@ -1004,10 +1587,23 @@ function EntityAgentPanel({
           onClose={() => setFilesOpen(false)}
         />
       )}
-      <div className="entity-agent-log" ref={logRef}>
+      <div
+        className="entity-agent-log"
+        ref={logRef}
+        onScroll={(event) => {
+          const element = event.currentTarget;
+          // Only an actual scroll up stops following; content growing below (scroll events arrive a frame late)
+          // must not be mistaken for the user leaving the bottom.
+          if (element.scrollTop < lastScrollTopRef.current - 2)
+            stickToBottomRef.current = false;
+          if (element.scrollHeight - element.scrollTop - element.clientHeight < 160)
+            stickToBottomRef.current = true;
+          lastScrollTopRef.current = element.scrollTop;
+        }}
+      >
         {!corpus && (
           <p className="text-secondary small">
-            Wybierz korpus po lewej, aby rozpocząć rozmowę.
+            Otwórz korpus z galerii, aby rozpocząć rozmowę.
           </p>
         )}
         {corpus && !log.length && (
@@ -1019,26 +1615,22 @@ function EntityAgentPanel({
             czatu.
           </p>
         )}
-        {log.map((item, index) =>
-          item.kind === "tool" ? (
-            <div className="entity-agent-tool" key={index}>
-              → {item.text}
-            </div>
-          ) : item.kind === "error" ? (
-            <div className="text-danger small" key={index}>
-              {item.text}
-            </div>
+        {groupLog(log).map((segment) =>
+          segment.type === "bubble" ? (
+            <AgentBubble segment={segment} live={busy} key={segment.key} />
+          ) : segment.item.kind === "tool" || segment.item.kind === "error" ? (
+            <LogLine item={segment.item} live={busy} key={segment.key} />
           ) : (
-            <article className={`chat-message ${item.kind}`} key={index}>
-              <strong>{item.kind === "user" ? "Ty" : "Asystent"}</strong>
+            <article className={`chat-message ${segment.item.kind}`} key={segment.key}>
+              <strong>{segment.item.kind === "user" ? "Ty" : "Asystent"}</strong>
               <MessageContent
-                content={item.text}
-                markdown={item.kind === "assistant"}
+                content={segment.item.text}
+                markdown={segment.item.kind === "assistant"}
               />
             </article>
           ),
         )}
-        {busy && <div className="entity-agent-tool">Asystent pracuje…</div>}
+        {busy && <AgentWorking log={log} onLayout={keepAtBottom} />}
         {uploading > 0 && (
           <div className="entity-agent-tool">
             Wgrywanie i konwersja załączników: {uploading}…
@@ -1522,7 +2114,11 @@ function CorpusSettingsView({
               kosza — można go przywrócić przyciskiem „Cofnij”.
             </small>
           </div>
-          <button className="btn btn-outline-danger" type="button" onClick={onDelete}>
+          <button
+            className="btn btn-outline-danger"
+            type="button"
+            onClick={onDelete}
+          >
             <Trash2 size={16} className="me-1" /> Usuń korpus
           </button>
         </div>
@@ -2165,17 +2761,167 @@ function CorpusAnalysisView({
   );
 }
 
+function CorpusGallery({
+  corpora,
+  loading,
+  error,
+  onCreated,
+  openCreate = false,
+}: {
+  corpora: Corpus[];
+  loading: boolean;
+  error: string;
+  onCreated: (corpus: Corpus) => void;
+  openCreate?: boolean;
+}) {
+  const navigate = useNavigate();
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [createError, setCreateError] = useState("");
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!name.trim() || busy) return;
+    setBusy(true);
+    setCreateError("");
+    try {
+      const corpus = await api.createCorpus(name.trim(), description.trim());
+      onCreated(corpus);
+      navigate(`/corpora/${corpus.id}`);
+    } catch (error) {
+      setCreateError(
+        error instanceof Error ? error.message : "Nie udało się utworzyć korpusu.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <MediumPageTemplate
+      eyebrow="KORPUSY"
+      title="Korpusy"
+      actions={
+        <NavLink className="btn btn-primary align-self-start" to="/corpora/new">
+          <FilePlus2 size={17} className="me-1" /> Nowy korpus
+        </NavLink>
+      }
+    >
+      {error && (
+        <div className="alert alert-danger mt-3" role="alert">{error}</div>
+      )}
+      {loading ? (
+        <p className="text-secondary mt-4" role="status">
+          Ładowanie korpusów…
+        </p>
+      ) : !corpora.length && !error ? (
+        <div className="card p-4 mt-4">
+          <h2 className="h5">Brak korpusów</h2>
+          <p className="text-secondary mb-0">
+            Utwórz pierwszy korpus, aby dodać przykłady i rozpocząć pracę z asystentem.
+          </p>
+        </div>
+      ) : (
+        <div className="corpus-gallery mt-4">
+          {corpora.map((corpus) => (
+            <NavLink
+              className="corpus-tile"
+              key={corpus.id}
+              to={`/corpora/${corpus.id}`}
+            >
+              <div className="d-flex align-items-center gap-2">
+                <Database size={21} />
+                <h2 className="h5 mb-0">{corpus.name}</h2>
+              </div>
+              <p className="text-secondary mb-0">
+                {corpus.description || "Brak opisu."}
+              </p>
+              <div className="d-flex flex-wrap gap-3 small mt-auto">
+                <span><strong>{corpus.example_count}</strong> przykładów</span>
+                {corpus.proposal_count !== undefined && (
+                  <span><strong>{corpus.proposal_count}</strong> propozycji</span>
+                )}
+              </div>
+            </NavLink>
+          ))}
+        </div>
+      )}
+      {openCreate && (
+        <div className="modal-backdrop show confirm-backdrop">
+          <div
+            className="modal d-block"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="gallery-create-title"
+          >
+            <div className="modal-dialog">
+              <form
+                className="modal-content"
+                onSubmit={(event) => void create(event)}
+              >
+                <div className="modal-header">
+                  <h2 className="h5 modal-title" id="gallery-create-title">
+                    Nowy korpus
+                  </h2>
+                </div>
+                <div className="modal-body">
+                  {createError && (
+                    <div className="alert alert-danger" role="alert">
+                      {createError}
+                    </div>
+                  )}
+                  <label className="form-label" htmlFor="gallery-name">
+                    Nazwa
+                  </label>
+                  <input
+                    id="gallery-name"
+                    className="form-control mb-3"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    required
+                    autoFocus
+                    disabled={busy}
+                  />
+                  <label className="form-label" htmlFor="gallery-description">
+                    Opis
+                  </label>
+                  <textarea
+                    id="gallery-description"
+                    className="form-control"
+                    rows={3}
+                    value={description}
+                    onChange={(event) => setDescription(event.target.value)}
+                    disabled={busy}
+                  />
+                </div>
+                <div className="modal-footer">
+                  <button
+                    className="btn btn-outline-secondary"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => navigate("/corpora")}
+                  >
+                    Anuluj
+                  </button>
+                  <button className="btn btn-primary" disabled={busy || !name.trim()}>
+                    {busy ? "Tworzenie…" : "Utwórz"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+    </MediumPageTemplate>
+  );
+}
+
 function CorporaPage({
   corpora,
-  onCreated,
   onCorpusUpdated,
-  openCreate = false,
   initialSplit,
 }: {
   corpora: Corpus[];
-  onCreated: (corpus: Corpus) => void;
   onCorpusUpdated: () => void;
-  openCreate?: boolean;
   initialSplit?: Split;
 }) {
   const navigate = useNavigate();
@@ -2183,10 +2929,131 @@ function CorporaPage({
   const selectedCorpus = corpora.find((corpus) => corpus.id === corpusId);
   const loadExamples = () =>
     corpusId ? api.examples(corpusId) : Promise.resolve<Example[]>([]);
+  const { chatId } = useParams();
+  const [conversations, setConversations] = useState<AgentConversation[]>(
+    [],
+  );
+  const [conversationsLoading, setConversationsLoading] = useState(true);
+  const [conversationsError, setConversationsError] = useState("");
+  // Only conversations with content are listed; a new chat appears once it has a message or an attachment.
+  const savedConversations = conversations.filter(
+    (conversation) => conversation.event_count > 0,
+  );
+  // A new chat gets its UUID up front, so creating it on the first message keeps the panel mounted.
+  const [draftId, setDraftId] = useState(() => crypto.randomUUID());
+  const activeChatId = chatId ?? draftId;
+  const [loadedChat, setLoadedChat] = useState<{
+    id: string;
+    log: AgentLogItem[];
+    persisted: boolean;
+  } | null>(null);
+  const loadedChatId = loadedChat?.id;
+  const [chatError, setChatError] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
+  const [deletingChat, setDeletingChat] = useState("");
+  const loadConversations = async () => {
+    if (!corpusId) return;
+    try {
+      setConversations(await api.conversations(corpusId));
+      setConversationsError("");
+    } catch (error) {
+      setConversationsError(
+        error instanceof Error
+          ? error.message
+          : "Nie udało się pobrać listy rozmów.",
+      );
+    } finally {
+      setConversationsLoading(false);
+    }
+  };
   useEffect(() => {
-    if (!corpusId && !openCreate && corpora.length)
-      navigate(`/corpora/${corpora[0].id}`, { replace: true });
-  }, [corpusId, openCreate, corpora, navigate]);
+    if (!corpusId) return;
+    void (async () => {
+      try {
+        await importLegacyChats(corpusId);
+      } catch (error) {
+        setConversationsError(
+          `Nie udało się przenieść rozmów zapisanych w przeglądarce: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      await loadConversations();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [corpusId]);
+  useEffect(() => {
+    setChatError("");
+    if (!chatId) {
+      setLoadedChat({ id: draftId, log: [], persisted: false });
+      return;
+    }
+    if (loadedChatId === chatId) return;
+    let current = true;
+    api
+      .conversation(chatId)
+      .then((conversation) => {
+        if (!current) return;
+        if (conversation.corpus_id !== corpusId) {
+          navigate(`/corpora/${conversation.corpus_id}/chats/${chatId}`, {
+            replace: true,
+          });
+          return;
+        }
+        setLoadedChat({
+          id: chatId,
+          log: eventsToLog(conversation.events),
+          persisted: true,
+        });
+      })
+      .catch((error) => {
+        if (!current) return;
+        setChatError(
+          error instanceof Error
+            ? error.message
+            : "Nie udało się wczytać rozmowy.",
+        );
+      });
+    return () => {
+      current = false;
+    };
+  }, [chatId, draftId, corpusId, loadedChatId, navigate]);
+  const ensureConversation = async () => {
+    if (!corpusId || chatId) return;
+    const id = draftId;
+    await api.createConversation(corpusId, { id });
+    setLoadedChat((current) =>
+      current?.id === id ? { ...current, persisted: true } : current,
+    );
+    navigate(`/corpora/${corpusId}/chats/${id}`, { replace: true });
+  };
+  const newChat = () => {
+    if (chatBusy || !corpusId) return;
+    setAgentRequest(null);
+    setDraftId(crypto.randomUUID());
+    navigate(`/corpora/${corpusId}`);
+  };
+  const deleteChat = async (conversation: AgentConversation) => {
+    if (
+      !window.confirm(
+        `Usunąć rozmowę „${conversation.title ?? "bez tytułu"}” razem z jej folderem sandboksa (załączniki, pliki robocze)? Tego nie można cofnąć.`,
+      )
+    )
+      return;
+    setDeletingChat(conversation.id);
+    setConversationsError("");
+    try {
+      await api.deleteConversation(conversation.id);
+      if (conversation.id === chatId) newChat();
+      await loadConversations();
+    } catch (error) {
+      setConversationsError(
+        error instanceof Error
+          ? error.message
+          : "Nie udało się usunąć rozmowy.",
+      );
+    } finally {
+      setDeletingChat("");
+    }
+  };
   const splitRef = useRef<HTMLDivElement>(null);
   const [agentWidth, setAgentWidth] = useState<number | null>(
     () => Number(localStorage.getItem("corpora-agent-width")) || null,
@@ -2196,15 +3063,11 @@ function CorporaPage({
     if (!bounds || !event.currentTarget.hasPointerCapture(event.pointerId))
       return;
     const width = Math.round(
-      Math.min(Math.max(bounds.right - event.clientX, 320), bounds.width - 480),
+      Math.min(Math.max(bounds.right - event.clientX, 320), bounds.width - 740),
     );
     setAgentWidth(width);
     localStorage.setItem("corpora-agent-width", String(width));
   };
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [open, setOpen] = useState(false);
-  const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
   const [examples, setExamples] = useState<Example[]>([]);
   const [examplesLoading, setExamplesLoading] = useState(false);
@@ -2328,12 +3191,18 @@ function CorporaPage({
     try {
       const result = await api.deleteCorpus(selectedCorpus.id);
       if (result.trash_id)
-        setLastDeletion({ trashId: result.trash_id, count: result.deleted, corpusName: result.name });
+        setLastDeletion({
+          trashId: result.trash_id,
+          count: result.deleted,
+          corpusName: result.name,
+        });
       onCorpusUpdated();
       navigate("/corpora");
     } catch (error) {
       setImportError(
-        error instanceof Error ? error.message : "Nie udało się usunąć korpusu.",
+        error instanceof Error
+          ? error.message
+          : "Nie udało się usunąć korpusu.",
       );
     } finally {
       setBusy(false);
@@ -2374,6 +3243,7 @@ function CorporaPage({
   const [lastRevision, setLastRevision] = useState<{
     revisionId: string;
     count: number;
+    label?: string;
   } | null>(null);
   const reloadExamples = async () => setExamples(await loadExamples());
   async function previewTransform(
@@ -2431,7 +3301,7 @@ function CorporaPage({
       await reloadExamples();
       setLastRevision(null);
       setImportNotice(
-        `Przywrócono poprzednią treść odpowiedzi: ${result.reverted}.`,
+        `Przywrócono poprzednią wersję przykładów: ${result.reverted}.`,
       );
     } catch (error) {
       setImportError(
@@ -2480,9 +3350,6 @@ function CorporaPage({
   );
   const paraphraseModels =
     paraphraseProviders[paraphraseProvider]?.models ?? {};
-  useEffect(() => {
-    setOpen(openCreate);
-  }, [openCreate]);
   useEffect(() => {
     setSplitFilter(initialSplit ?? "");
   }, [initialSplit]);
@@ -2562,17 +3429,6 @@ function CorporaPage({
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [manualPromptOpen]);
-  async function submit() {
-    setBusy(true);
-    try {
-      const corpus = await api.createCorpus(name.trim(), description.trim());
-      onCreated(corpus);
-      navigate(`/builder/${corpus.id}`);
-    } finally {
-      setBusy(false);
-      setConfirm(false);
-    }
-  }
   async function importEntities(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -3096,6 +3952,28 @@ function CorporaPage({
   const proposals = examples.filter(
     (example) => example.metadata.flag === "proposal",
   );
+  // Proposals of a series agents are still working on: visible, but not selectable or editable.
+  const openProposals = proposals.filter((example) => !example.locked);
+  const lockedProposals = proposals.length - openProposals.length;
+  const drawerLocked = Boolean(selectedExample?.locked);
+  useEffect(() => {
+    const locked = new Set(
+      examples.filter((example) => example.locked).map((example) => example.id),
+    );
+    setSelectedIds((current) =>
+      [...current].some((id) => locked.has(id))
+        ? new Set([...current].filter((id) => !locked.has(id)))
+        : current,
+    );
+    setSelectedExample((current) => {
+      const found = current
+        ? examples.find((example) => example.id === current.id)
+        : undefined;
+      return current && found && Boolean(found.locked) !== Boolean(current.locked)
+        ? { ...current, locked: found.locked }
+        : current;
+    });
+  }, [examples]);
   const filteredExamples = corpusExamples.filter((example) => {
     const createdAt = new Date(example.created_at);
     const from = fromDate ? new Date(`${fromDate}T00:00:00`) : null;
@@ -3192,90 +4070,102 @@ function CorporaPage({
       ref={splitRef}
       style={{
         gridTemplateColumns: agentWidth
-          ? `minmax(0, 1fr) 6px ${agentWidth}px`
-          : "minmax(0, 2fr) 6px 1fr",
+          ? `260px minmax(0, 1fr) 6px minmax(320px, min(${agentWidth}px, calc(100% - 740px)))`
+          : "260px minmax(0, 2fr) 6px minmax(320px, 1fr)",
       }}
     >
+      <aside className="corpus-chat-sidebar" aria-label="Czaty korpusu">
+        <NavLink className="small text-secondary" to="/corpora">
+          Wszystkie korpusy
+        </NavLink>
+        <div className="sidebar-title mt-3">
+          <MessageSquareText size={16} /> CZATY
+        </div>
+        <button
+          className="btn btn-primary w-100 mb-3"
+          type="button"
+          disabled={chatBusy}
+          onClick={newChat}
+        >
+          <Plus size={17} className="me-1" /> Nowy czat
+        </button>
+        {conversationsError && (
+          <div className="alert alert-danger small" role="alert">
+            {conversationsError}
+          </div>
+        )}
+        <nav className="corpus-chat-list" aria-label="Historia czatów">
+          {conversationsLoading && (
+            <p className="small text-secondary" role="status">
+              Ładowanie rozmów…
+            </p>
+          )}
+          {!conversationsLoading &&
+            !savedConversations.length &&
+            !conversationsError && (
+              <p className="small text-secondary">Brak zapisanych rozmów.</p>
+            )}
+          {savedConversations.map((conversation) => {
+            const title = conversation.title ?? "Rozmowa bez tytułu";
+            const active = conversation.id === chatId;
+            return (
+              <div
+                className={`corpus-chat-item${active ? " active" : ""}`}
+                key={conversation.id}
+              >
+                <NavLink
+                  className={`corpus-chat-link${chatBusy ? " disabled" : ""}`}
+                  to={`/corpora/${corpusId}/chats/${conversation.id}`}
+                  title={title}
+                  aria-current={active ? "page" : undefined}
+                  aria-disabled={chatBusy || undefined}
+                  onClick={(event) => {
+                    if (chatBusy) event.preventDefault();
+                  }}
+                >
+                  <span>{title}</span>
+                  <small>
+                    {new Date(conversation.updated_at).toLocaleString("pl-PL")}
+                    {!conversation.event_count && " · bez historii"}
+                  </small>
+                </NavLink>
+                <button
+                  className="btn btn-sm btn-link corpus-chat-delete"
+                  type="button"
+                  title="Usuń rozmowę i jej folder sandboksa"
+                  aria-label={`Usuń rozmowę ${title}`}
+                  disabled={
+                    deletingChat === conversation.id || (active && chatBusy)
+                  }
+                  onClick={() => void deleteChat(conversation)}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            );
+          })}
+        </nav>
+      </aside>
       <MediumPageTemplate
         eyebrow="PRZEGLĄD"
         title={`Przykłady SFT${selectedCorpus ? `: ${selectedCorpus.name}` : ""}`}
         actions={
-          <div className="d-flex flex-column gap-2 align-self-start">
-            <div className="d-flex flex-wrap gap-2">
-              <div className="input-group input-group-sm export-control">
-                <select
-                  className="form-select"
-                  value={exportSplit}
-                  disabled={!selectedCorpus}
-                  onChange={(event) =>
-                    setExportSplit(event.target.value as ExampleSplit | "all")
-                  }
-                  aria-label="Split eksportu"
-                >
-                  <option value="all">wszystkie</option>
-                  <option value="train">train</option>
-                  <option value="validation">validation</option>
-                  <option value="test">test</option>
-                  <option value="unassigned">bez splitu</option>
-                </select>
-                {selectedCorpus ? (
-                  <a
-                    className="btn btn-outline-primary"
-                    href={`/api/corpora/${selectedCorpus.id}/export?split=${exportSplit}`}
-                    download={`corpus-${selectedCorpus.id}-${exportSplit}.jsonl`}
-                  >
-                    <Download size={17} className="me-1" /> Eksportuj
-                  </a>
-                ) : (
-                  <button
-                    className="btn btn-outline-primary"
-                    type="button"
-                    disabled
-                  >
-                    <Download size={17} className="me-1" /> Eksportuj
-                  </button>
-                )}
-              </div>
-              <div className="input-group input-group-sm export-control">
-                <select
-                  className="form-select"
-                  value={importSplit}
-                  disabled={busy || !selectedCorpus}
-                  onChange={(event) =>
-                    setImportSplit(event.target.value as Split)
-                  }
-                  aria-label="Domyślny split importu"
-                >
-                  <option value="train">train</option>
-                  <option value="validation">validation</option>
-                  <option value="test">test</option>
-                </select>
-                <label className="btn btn-outline-primary mb-0">
-                  <FileUp size={17} className="me-1" /> Importuj JSONL
-                  <input
-                    className="visually-hidden"
-                    type="file"
-                    accept=".jsonl,.ndjson,application/json"
-                    disabled={busy || !selectedCorpus}
-                    onChange={(event) => void importEntities(event)}
-                  />
-                </label>
-              </div>
-              <button
-                className="btn btn-primary"
-                type="button"
-                disabled={!selectedCorpus}
-                onClick={() => navigate(`/builder/${selectedCorpus?.id}`)}
-              >
-                <FilePlus2 size={17} className="me-1" /> Dodaj przykład
-              </button>
-            </div>
-          </div>
+          <button
+            className="btn btn-primary align-self-start"
+            type="button"
+            disabled={!selectedCorpus}
+            onClick={() => navigate(`/builder/${selectedCorpus?.id}`)}
+          >
+            <FilePlus2 size={17} className="me-1" /> Dodaj przykład
+          </button>
         }
       >
         {lastRevision && (
           <div className="alert alert-info d-flex justify-content-between align-items-center gap-2">
-            <span>Przekształcono odpowiedzi: {lastRevision.count}.</span>
+            <span>
+              {lastRevision.label ?? "Przekształcono odpowiedzi"}:{" "}
+              {lastRevision.count}.
+            </span>
             <span className="d-flex gap-2">
               <button
                 className="btn btn-sm btn-info"
@@ -3690,7 +4580,7 @@ function CorporaPage({
         {!corpusId && activeView !== "duplicates" && (
           <div className="text-secondary">
             {corpora.length
-              ? "Wybierz korpus z listy po lewej."
+              ? "Otwórz korpus z galerii korpusów."
               : "Brak korpusów — utwórz pierwszy przyciskiem „Nowy korpus”."}
           </div>
         )}
@@ -3701,26 +4591,38 @@ function CorporaPage({
               ewaluacji ani eksportu, dopóki ich nie zaakceptujesz — akceptacja
               nadaje flagę zaproponowaną przez asystenta.
             </p>
+            {lockedProposals > 0 && (
+              <div className="alert alert-secondary py-2 small d-flex align-items-center gap-2">
+                <span aria-hidden="true">🔒</span>
+                Propozycje w pracy agentów: {lockedProposals}. Widzisz je na
+                bieżąco; akceptacja, edycja i odrzucanie będą możliwe po
+                zakończeniu tury asystenta.
+              </div>
+            )}
             {proposals.length ? (
               <>
                 <div className="bulk-actions mb-3">
                   <label className="d-flex align-items-center gap-2 mb-0">
                     <input
                       type="checkbox"
-                      checked={proposals.every((example) =>
-                        selectedIds.has(example.id),
-                      )}
+                      disabled={!openProposals.length}
+                      checked={
+                        openProposals.length > 0 &&
+                        openProposals.every((example) =>
+                          selectedIds.has(example.id),
+                        )
+                      }
                       onChange={() =>
                         setSelectedIds(
-                          proposals.every((example) =>
+                          openProposals.every((example) =>
                             selectedIds.has(example.id),
                           )
                             ? new Set()
-                            : new Set(proposals.map((example) => example.id)),
+                            : new Set(openProposals.map((example) => example.id)),
                         )
                       }
                     />
-                    Zaznacz wszystkie ({proposals.length})
+                    Zaznacz wszystkie ({openProposals.length})
                   </label>
                   <button
                     className="btn btn-sm btn-success ms-auto"
@@ -3748,13 +4650,14 @@ function CorporaPage({
                     ).length;
                     return (
                       <div
-                        className={`list-group-item entity-list-item d-flex align-items-start gap-2 ${selectedExample?.id === example.id ? "selected" : ""}`}
+                        className={`list-group-item entity-list-item d-flex align-items-start gap-2 ${selectedExample?.id === example.id ? "selected" : ""} ${example.locked ? "proposal-locked" : ""}`}
                         key={example.id}
                       >
                         <input
                           className="form-check-input mt-1"
                           type="checkbox"
                           checked={selectedIds.has(example.id)}
+                          disabled={example.locked}
                           onChange={() => toggleSelection(example.id)}
                           aria-label="Zaznacz propozycję"
                         />
@@ -3768,6 +4671,14 @@ function CorporaPage({
                               {formatCreatedAt(example.created_at)}
                             </small>
                             <span className="d-flex flex-wrap gap-2 mb-1">
+                              {example.locked && (
+                                <span
+                                  className="badge text-bg-secondary"
+                                  title="Agenci jeszcze pracują nad tą serią"
+                                >
+                                  🔒 w pracy agentów
+                                </span>
+                              )}
                               <span className="badge text-bg-primary">
                                 propozycja
                               </span>
@@ -3824,7 +4735,7 @@ function CorporaPage({
                             type="button"
                             title="Akceptuj"
                             aria-label="Akceptuj"
-                            disabled={busy}
+                            disabled={busy || example.locked}
                             onClick={() => void acceptProposals([example.id])}
                           >
                             <Check size={15} />
@@ -3834,7 +4745,7 @@ function CorporaPage({
                             type="button"
                             title="Odrzuć"
                             aria-label="Odrzuć"
-                            disabled={busy}
+                            disabled={busy || example.locked}
                             onClick={() => void removeExample(example)}
                           >
                             <Trash2 size={15} />
@@ -3853,12 +4764,80 @@ function CorporaPage({
           </section>
         )}
         {corpusId && activeView === "settings" && (
-          <CorpusSettingsView
-            corpusId={corpusId}
-            onSaved={onCorpusUpdated}
-            section="general"
-            onDelete={() => void deleteCorpus()}
-          />
+          <>
+            <section className="mb-4" aria-labelledby="corpus-transfer-title">
+              <h2 className="panel-title mb-2" id="corpus-transfer-title">
+                EKSPORT I IMPORT
+              </h2>
+              <div className="d-flex flex-wrap gap-2">
+                <div className="input-group input-group-sm export-control">
+                  <select
+                    className="form-select"
+                    value={exportSplit}
+                    disabled={!selectedCorpus}
+                    onChange={(event) =>
+                      setExportSplit(event.target.value as ExampleSplit | "all")
+                    }
+                    aria-label="Split eksportu"
+                  >
+                    <option value="all">wszystkie</option>
+                    <option value="train">train</option>
+                    <option value="validation">validation</option>
+                    <option value="test">test</option>
+                    <option value="unassigned">bez splitu</option>
+                  </select>
+                  {selectedCorpus ? (
+                    <a
+                      className="btn btn-outline-primary"
+                      href={`/api/corpora/${selectedCorpus.id}/export?split=${exportSplit}`}
+                      download={`corpus-${selectedCorpus.id}-${exportSplit}.jsonl`}
+                    >
+                      <Download size={17} className="me-1" /> Eksportuj
+                    </a>
+                  ) : (
+                    <button
+                      className="btn btn-outline-primary"
+                      type="button"
+                      disabled
+                    >
+                      <Download size={17} className="me-1" /> Eksportuj
+                    </button>
+                  )}
+                </div>
+                <div className="input-group input-group-sm export-control">
+                  <select
+                    className="form-select"
+                    value={importSplit}
+                    disabled={busy || !selectedCorpus}
+                    onChange={(event) =>
+                      setImportSplit(event.target.value as Split)
+                    }
+                    aria-label="Domyślny split importu"
+                  >
+                    <option value="train">train</option>
+                    <option value="validation">validation</option>
+                    <option value="test">test</option>
+                  </select>
+                  <label className="btn btn-outline-primary mb-0">
+                    <FileUp size={17} className="me-1" /> Importuj JSONL
+                    <input
+                      className="visually-hidden"
+                      type="file"
+                      accept=".jsonl,.ndjson,application/json"
+                      disabled={busy || !selectedCorpus}
+                      onChange={(event) => void importEntities(event)}
+                    />
+                  </label>
+                </div>
+              </div>
+            </section>
+            <CorpusSettingsView
+              corpusId={corpusId}
+              onSaved={onCorpusUpdated}
+              section="general"
+              onDelete={() => void deleteCorpus()}
+            />
+          </>
         )}
         {corpusId && activeView === "dpo" && (
           <PreferenceBatchView
@@ -4449,6 +5428,14 @@ function CorporaPage({
                   <small className="text-secondary">
                     {formatCreatedAt(selectedExample.created_at)}
                   </small>
+                  {drawerLocked && (
+                    <span
+                      className="badge text-bg-secondary ms-2"
+                      title="Agenci jeszcze pracują nad tą serią — tylko podgląd"
+                    >
+                      🔒 w pracy agentów
+                    </span>
+                  )}
                 </div>
                 <div className="d-flex flex-wrap justify-content-end gap-2">
                   <button
@@ -4492,6 +5479,7 @@ function CorporaPage({
                     <button
                       className="btn btn-primary"
                       type="button"
+                      disabled={drawerLocked}
                       onClick={() =>
                         navigate(
                           `/builder/${selectedExample.corpus_id ?? corpusId}?edit=${selectedExample.id}`,
@@ -4533,7 +5521,7 @@ function CorporaPage({
                         type="button"
                         title="Usuń przykład (do kosza)"
                         aria-label="Usuń przykład"
-                        disabled={busy}
+                        disabled={busy || drawerLocked}
                         onClick={() => void removeExample(selectedExample)}
                       >
                         <Trash2 size={15} />
@@ -4578,7 +5566,7 @@ function CorporaPage({
                 <button
                   className="btn btn-sm btn-outline-success"
                   type="button"
-                  disabled={busy || drawerEditing}
+                  disabled={busy || drawerEditing || drawerLocked}
                   onClick={() => void applyFlag("positive")}
                 >
                   Oznacz ręcznie: positive
@@ -4586,7 +5574,7 @@ function CorporaPage({
                 <button
                   className="btn btn-sm btn-outline-danger"
                   type="button"
-                  disabled={busy || drawerEditing}
+                  disabled={busy || drawerEditing || drawerLocked}
                   onClick={() => void applyFlag("negative")}
                 >
                   Oznacz ręcznie: negative
@@ -4598,6 +5586,7 @@ function CorporaPage({
                     className={`chat-message ${message.role} ${editingMessageIndex === index ? "editing" : ""}`}
                     key={`${message.role}-${index}`}
                     onClick={() => {
+                      if (drawerLocked) return;
                       setDrawerEditing(true);
                       setEditingMessageIndex(index);
                     }}
@@ -4721,94 +5710,6 @@ function CorporaPage({
             </aside>
           </>
         )}
-        {open && (
-          <div className="modal-backdrop show confirm-backdrop">
-            <div className="modal d-block" role="dialog">
-              <div className="modal-dialog">
-                <div className="modal-content">
-                  <div className="modal-header">
-                    <h2 className="h5 modal-title">Nowy korpus</h2>
-                  </div>
-                  <form
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      if (name.trim()) setConfirm(true);
-                    }}
-                  >
-                    <div className="modal-body">
-                      <label className="form-label" htmlFor="new-name">
-                        Nazwa
-                      </label>
-                      <input
-                        id="new-name"
-                        className="form-control mb-3"
-                        value={name}
-                        onChange={(event) => setName(event.target.value)}
-                        required
-                      />
-                      <label className="form-label" htmlFor="new-description">
-                        Opis
-                      </label>
-                      <textarea
-                        id="new-description"
-                        className="form-control"
-                        rows={3}
-                        value={description}
-                        onChange={(event) => setDescription(event.target.value)}
-                      />
-                    </div>
-                    <div className="modal-footer">
-                      <button
-                        className="btn btn-outline-secondary"
-                        type="button"
-                        onClick={() => {
-                          setOpen(false);
-                          navigate("/corpora");
-                        }}
-                      >
-                        Anuluj
-                      </button>
-                      <button className="btn btn-primary">Utwórz</button>
-                    </div>
-                  </form>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-        {confirm && (
-          <div className="modal-backdrop show confirm-backdrop">
-            <div className="modal d-block" role="dialog">
-              <div className="modal-dialog">
-                <div className="modal-content">
-                  <div className="modal-header">
-                    <h2 className="h5 modal-title">Potwierdź utworzenie</h2>
-                  </div>
-                  <div className="modal-body">
-                    <strong>{name}</strong>
-                  </div>
-                  <div className="modal-footer">
-                    <button
-                      className="btn btn-outline-secondary"
-                      type="button"
-                      onClick={() => setConfirm(false)}
-                    >
-                      Wróć
-                    </button>
-                    <button
-                      className="btn btn-primary"
-                      type="button"
-                      disabled={busy}
-                      onClick={() => void submit()}
-                    >
-                      Potwierdź
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
       </MediumPageTemplate>
       <div
         className="training-splitter corpora-splitter"
@@ -4825,13 +5726,63 @@ function CorporaPage({
           localStorage.removeItem("corpora-agent-width");
         }}
       />
-      <EntityAgentPanel
-        corpus={selectedCorpus}
-        onAdded={reloadExamples}
-        request={agentRequest}
-      />
+      {loadedChat && loadedChat.id === activeChatId ? (
+        <EntityAgentPanel
+          key={loadedChat.id}
+          corpus={selectedCorpus}
+          onAdded={reloadExamples}
+          request={agentRequest}
+          conversationId={loadedChat.id}
+          persisted={loadedChat.persisted}
+          initialLog={loadedChat.log}
+          ensureConversation={ensureConversation}
+          onNewChat={newChat}
+          onBusyChange={setChatBusy}
+          onConversationChanged={() => void loadConversations()}
+          onExamplesEdited={(revision, count) =>
+            // Several edits in one turn: the newest revision is offered for undo.
+            setLastRevision({
+              revisionId: revision,
+              count,
+              label: "Asystent zmienił zaakceptowane przykłady",
+            })
+          }
+        />
+      ) : (
+        <aside className="entity-agent">
+          <div className="p-3">
+            {chatError ? (
+              <div className="alert alert-danger" role="alert">
+                {chatError}
+                <div className="mt-2">
+                  <button
+                    className="btn btn-sm btn-outline-danger"
+                    type="button"
+                    onClick={newChat}
+                  >
+                    Rozpocznij nowy czat
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <p className="text-secondary small" role="status">
+                Ładowanie rozmowy…
+              </p>
+            )}
+          </div>
+        </aside>
+      )}
     </div>
   );
+}
+
+function CorpusRoute(props: {
+  corpora: Corpus[];
+  onCorpusUpdated: () => void;
+}) {
+  // Switching chats keeps the corpus view mounted; only another corpus remounts it.
+  const { corpusId } = useParams();
+  return <CorporaPage key={corpusId} {...props} />;
 }
 
 function Builder({ corpora }: { corpora: Corpus[] }) {
@@ -6655,7 +7606,9 @@ function DeploymentPanel({
             <button
               className="btn btn-sm btn-outline-danger"
               type="button"
-              disabled={busy || !selectedCheckpoint || selectedCheckpoint === "base"}
+              disabled={
+                busy || !selectedCheckpoint || selectedCheckpoint === "base"
+              }
               onClick={() => void remove(selectedCheckpoint)}
             >
               <Trash2 size={14} className="me-1" /> Usuń checkpoint{" "}
@@ -7731,11 +8684,24 @@ function Training({ evaluationOnly = false }: { evaluationOnly?: boolean }) {
 
 function Workspace() {
   const [corpora, setCorpora] = useState<Corpus[]>([]);
+  const [corporaLoading, setCorporaLoading] = useState(true);
+  const [corporaError, setCorporaError] = useState("");
   const pathname = useLocation().pathname;
-  const showSidebar = !["/training", "/evaluation"].some((path) =>
+  const showSidebar = !["/corpora", "/training", "/evaluation"].some((path) =>
     pathname.startsWith(path),
   );
-  const refresh = () => api.corpora().then(setCorpora);
+  const refresh = async () => {
+    setCorporaError("");
+    try {
+      setCorpora(await api.corpora());
+    } catch (error) {
+      setCorporaError(
+        error instanceof Error ? error.message : "Nie udało się pobrać korpusów.",
+      );
+    } finally {
+      setCorporaLoading(false);
+    }
+  };
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => localStorage.getItem("corpus-sidebar-collapsed") === "1",
   );
@@ -7839,23 +8805,31 @@ function Workspace() {
           <Route
             path="/corpora"
             element={
-              <CorporaPage
+              <CorpusGallery
+                key={pathname}
                 corpora={corpora}
+                loading={corporaLoading}
+                error={corporaError}
                 onCreated={(corpus) =>
                   setCorpora((current) => [corpus, ...current])
                 }
-                onCorpusUpdated={() => void refresh()}
               />
             }
           />
           <Route
             path="/corpora/:corpusId"
             element={
-              <CorporaPage
+              <CorpusRoute
                 corpora={corpora}
-                onCreated={(corpus) =>
-                  setCorpora((current) => [corpus, ...current])
-                }
+                onCorpusUpdated={() => void refresh()}
+              />
+            }
+          />
+          <Route
+            path="/corpora/:corpusId/chats/:chatId"
+            element={
+              <CorpusRoute
+                corpora={corpora}
                 onCorpusUpdated={() => void refresh()}
               />
             }
@@ -7863,12 +8837,14 @@ function Workspace() {
           <Route
             path="/corpora/new"
             element={
-              <CorporaPage
+              <CorpusGallery
+                key={pathname}
                 corpora={corpora}
+                loading={corporaLoading}
+                error={corporaError}
                 onCreated={(corpus) =>
                   setCorpora((current) => [corpus, ...current])
                 }
-                onCorpusUpdated={() => void refresh()}
                 openCreate
               />
             }

@@ -29,6 +29,7 @@ export type Example = {
   id: string;
   corpus_id?: string;
   corpus_name?: string;
+  locked?: boolean;
   created_at: string;
   split: "train" | "validation" | "test" | "unassigned";
   messages: Array<{ role: string; content: string }>;
@@ -330,8 +331,46 @@ export type AgentEvent =
       count: number;
     }
   | { type: "examples_parked"; count: number }
+  | { type: "examples_updated"; count: number; revision: string | null }
+  | {
+      type: "agent_tool";
+      agent: string;
+      scope?: string;
+      name: string;
+      phase: "call" | "result";
+      detail?: string;
+      ok?: boolean;
+      ms?: number;
+      error?: string;
+    }
+  | {
+      type: "plan";
+      intent: string;
+      status: string;
+      steps: Array<{ title: string; status: string }>;
+    }
   | { type: "error"; message: string }
   | { type: "done" };
+
+export type StoredAgentEvent =
+  | Exclude<AgentEvent, { type: "done" }>
+  | { type: "user"; content: string }
+  | ({ type: "attachment" } & AgentAttachment)
+  | { type: "log"; kind: "user" | "assistant" | "tool" | "error"; text: string }
+  | { type: "usage" };
+
+export type AgentConversation = {
+  id: string;
+  corpus_id: string;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+  event_count: number;
+};
+
+export type AgentConversationDetail = AgentConversation & {
+  events: StoredAgentEvent[];
+};
 
 export type AgentAttachment = {
   id: string;
@@ -557,9 +596,12 @@ export const api = {
       { method: "DELETE" },
     ),
   restoreTrash: (trashId: string) =>
-    request<{ restored: number; corpus_id?: string | null }>(`/api/trash/${trashId}/restore`, {
-      method: "POST",
-    }),
+    request<{ restored: number; corpus_id?: string | null }>(
+      `/api/trash/${trashId}/restore`,
+      {
+        method: "POST",
+      },
+    ),
   bulkTransform: (exampleIds: string[], transform: string, dryRun: boolean) =>
     request<BulkTransformResult>("/api/examples/bulk/transform", {
       method: "POST",
@@ -735,6 +777,28 @@ export const api = {
     ),
   agentSession: (sessionId: string) =>
     request<AgentSession>(`/api/agent/sessions/${sessionId}`),
+  conversations: (corpusId: string) =>
+    request<AgentConversation[]>(`/api/corpora/${corpusId}/conversations`),
+  conversation: (conversationId: string) =>
+    request<AgentConversationDetail>(
+      `/api/agent/conversations/${conversationId}`,
+    ),
+  createConversation: (
+    corpusId: string,
+    conversation: {
+      id: string;
+      legacy_log?: Array<{ kind: string; text: string }>;
+      created_at?: string;
+    },
+  ) =>
+    request<AgentConversation>(`/api/corpora/${corpusId}/conversations`, {
+      method: "POST",
+      body: JSON.stringify(conversation),
+    }),
+  deleteConversation: (conversationId: string) =>
+    request<{ deleted: string }>(`/api/agent/conversations/${conversationId}`, {
+      method: "DELETE",
+    }),
   closeAgentSession: (sessionId: string) =>
     request<AgentSession>(`/api/agent/sessions/${sessionId}/close`, {
       method: "POST",

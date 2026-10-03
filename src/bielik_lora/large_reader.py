@@ -536,9 +536,25 @@ def read_large_file_session(
         if event["type"] == "usage":
             reader.add_usage(event)
         elif event["type"] == "tool_call":
-            yield progress(f"{reader.read_id}: {describe(event['name'], event['arguments'])}")
-        elif event["type"] == "tool_result" and not event["ok"]:
-            yield progress(f"{reader.read_id}: {event['name']} \u2014 {event.get('error')}")
+            yield {
+                "type": "agent_tool",
+                "agent": "czytelnik",
+                "scope": reader.read_id,
+                "name": event["name"],
+                "phase": "call",
+                "detail": describe(event["name"], event["arguments"]),
+            }
+        elif event["type"] == "tool_result":
+            yield {
+                "type": "agent_tool",
+                "agent": "czytelnik",
+                "scope": reader.read_id,
+                "name": event["name"],
+                "phase": "result",
+                "ok": event["ok"],
+                **({"ms": event["ms"]} if event.get("ms") is not None else {}),
+                **({"error": str(event["error"])[:300]} if event.get("error") else {}),
+            }
         elif event["type"] == "progress":
             yield event
     record = sandbox.call(session_id, "large_read_record", {"read_id": reader.read_id})
